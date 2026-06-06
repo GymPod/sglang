@@ -78,6 +78,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.moe.expert_routing_mask import (
     decode_expert_routing_mask,
+    get_expert_routing_mask_backend_error,
     get_num_experts_from_config,
     get_num_experts_per_tok_from_config,
     get_num_hidden_layers_from_config,
@@ -2202,6 +2203,14 @@ class Scheduler(
             return
 
         if recv_req.expert_routing_mask is not None:
+            backend_error = get_expert_routing_mask_backend_error(
+                self.server_args, self.model_config
+            )
+            if backend_error is not None:
+                req.set_finish_with_abort(backend_error)
+                self._add_request_to_queue(req)
+                return
+
             num_layers = get_num_hidden_layers_from_config(self.model_config)
             top_k = get_num_experts_per_tok_from_config(self.model_config)
             num_experts = get_num_experts_from_config(self.model_config)

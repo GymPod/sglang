@@ -65,6 +65,39 @@ def get_num_experts_per_tok_from_config(model_config) -> Optional[int]:
     return None
 
 
+def _is_mxfp4_model_config(model_config) -> bool:
+    hf_config = getattr(model_config, "hf_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", hf_config)
+    for config in (hf_text_config, hf_config):
+        quantization_config = getattr(config, "quantization_config", None)
+        if (
+            isinstance(quantization_config, dict)
+            and quantization_config.get("quant_method") == "mxfp4"
+        ):
+            return True
+    return False
+
+
+def get_expert_routing_mask_backend_error(server_args, model_config) -> Optional[str]:
+    moe_runner_backend = getattr(server_args, "moe_runner_backend", None)
+    if moe_runner_backend in ("triton_kernel", "flashinfer_trtllm"):
+        return (
+            "expert_routing_mask requires explicit top-k routing. The current "
+            f"moe_runner_backend={moe_runner_backend!r} routes inside a fused "
+            "backend and cannot be safely constrained by supplied experts."
+        )
+    if moe_runner_backend == "flashinfer_mxfp4" and not _is_mxfp4_model_config(
+        model_config
+    ):
+        return (
+            "expert_routing_mask requires explicit top-k routing. The current "
+            "moe_runner_backend='flashinfer_mxfp4' uses bypassed routing for "
+            "non-MXFP4 expert checkpoints and cannot be safely constrained by "
+            "supplied experts."
+        )
+    return None
+
+
 def decode_expert_routing_mask(
     data: str,
     *,

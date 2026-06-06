@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pybase64
 import pytest
@@ -7,6 +9,7 @@ from sglang.srt.layers.moe.expert_routing_mask import (
     apply_expert_routing_mask,
     decode_expert_routing_mask,
     expert_routing_mask_context,
+    get_expert_routing_mask_backend_error,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
@@ -178,3 +181,45 @@ def test_expert_routing_mask_requires_input_ids_request_path():
     req = GenerateReqInput(input_ids=[1, 2, 3], expert_routing_mask="AAAA")
     req.normalize_batch_and_arguments()
     assert req.expert_routing_mask == "AAAA"
+
+
+def test_expert_routing_mask_backend_validation_rejects_fused_routing():
+    assert (
+        get_expert_routing_mask_backend_error(
+            SimpleNamespace(moe_runner_backend="triton_kernel"),
+            SimpleNamespace(hf_config=SimpleNamespace()),
+        )
+        is not None
+    )
+    assert (
+        get_expert_routing_mask_backend_error(
+            SimpleNamespace(moe_runner_backend="flashinfer_trtllm"),
+            SimpleNamespace(hf_config=SimpleNamespace()),
+        )
+        is not None
+    )
+    assert (
+        get_expert_routing_mask_backend_error(
+            SimpleNamespace(moe_runner_backend="flashinfer_mxfp4"),
+            SimpleNamespace(hf_config=SimpleNamespace()),
+        )
+        is not None
+    )
+    assert (
+        get_expert_routing_mask_backend_error(
+            SimpleNamespace(moe_runner_backend="flashinfer_mxfp4"),
+            SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    quantization_config={"quant_method": "mxfp4"}
+                )
+            ),
+        )
+        is None
+    )
+    assert (
+        get_expert_routing_mask_backend_error(
+            SimpleNamespace(moe_runner_backend="triton"),
+            SimpleNamespace(hf_config=SimpleNamespace()),
+        )
+        is None
+    )
