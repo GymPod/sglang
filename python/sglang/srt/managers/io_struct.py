@@ -178,6 +178,11 @@ class GenerateReqInput(BaseReq):
     # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
     # 0 = full sequence.
     routed_experts_start_len: int = 0
+    # Base64-encoded raw int32 tensor using the same encoding as returned
+    # routed_experts. Shape: [prompt_tokens, num_hidden_layers, num_experts_per_tok].
+    # Each row is the set of allowed logical/global expert ids for that prompt
+    # token and MoE layer.
+    expert_routing_mask: Optional[Union[List[Optional[str]], str]] = None
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -315,6 +320,22 @@ class GenerateReqInput(BaseReq):
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
             )
+        if self._has_expert_routing_mask() and (
+            self.input_ids is None
+            or self.text is not None
+            or self.input_embeds is not None
+        ):
+            raise ValueError(
+                "expert_routing_mask requires input_ids and is not supported for "
+                "text, chat, or input_embeds requests."
+            )
+
+    def _has_expert_routing_mask(self) -> bool:
+        if self.expert_routing_mask is None:
+            return False
+        if isinstance(self.expert_routing_mask, list):
+            return any(mask is not None for mask in self.expert_routing_mask)
+        return True
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""
@@ -404,6 +425,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
+        self._normalize_expert_routing_mask(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -573,6 +595,21 @@ class GenerateReqInput(BaseReq):
                 "Cannot use list custom_logit_processor with parallel_sample_num > 1"
             )
 
+    def _normalize_expert_routing_mask(self, num):
+        """Normalize expert routing masks for batch processing."""
+        if self.expert_routing_mask is None:
+            self.expert_routing_mask = [None] * num
+        elif not isinstance(self.expert_routing_mask, list):
+            self.expert_routing_mask = [self.expert_routing_mask] * num
+        elif len(self.expert_routing_mask) == self.batch_size:
+            self.expert_routing_mask = (
+                self.expert_routing_mask * self.parallel_sample_num
+            )
+        elif len(self.expert_routing_mask) != num:
+            raise ValueError(
+                "The length of expert_routing_mask should be equal to the batch size."
+            )
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -657,6 +694,11 @@ class GenerateReqInput(BaseReq):
             ),
             return_routed_experts=self.return_routed_experts,
             routed_experts_start_len=self.routed_experts_start_len,
+            expert_routing_mask=(
+                self.expert_routing_mask[i]
+                if isinstance(self.expert_routing_mask, list)
+                else self.expert_routing_mask
+            ),
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
@@ -735,6 +777,8 @@ class TokenizedGenerateReqInput(BaseReq):
     return_routed_experts: bool = False
     # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
+    # See GenerateReqInput.expert_routing_mask.
+    expert_routing_mask: Optional[str] = None
 
     return_indexer_topk: bool = False
 

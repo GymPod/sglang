@@ -59,6 +59,10 @@ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.layers.moe.expert_routing_mask import (
+    get_num_experts_per_tok_from_config,
+    get_num_hidden_layers_from_config,
+)
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -601,6 +605,7 @@ class Req(ReqDllmMixin):
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         return_indexer_topk: bool = False,
+        expert_routing_mask: Optional[str] = None,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -825,6 +830,9 @@ class Req(ReqDllmMixin):
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
+        self.expert_routing_mask_base64 = expert_routing_mask
+        self.expert_routing_mask: Optional[torch.Tensor] = None
+        self.routed_experts_for_cache: Optional[torch.Tensor] = None
 
         self.return_indexer_topk = return_indexer_topk
         self.indexer_topk: Optional[torch.Tensor] = (
@@ -929,6 +937,37 @@ class Req(ReqDllmMixin):
         spec_alg = get_global_server_args().speculative_algorithm
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
+    def get_expert_routing_cache_metadata(
+        self, length: int
+    ) -> Optional[torch.Tensor]:
+        routing_metadata = (
+            self.expert_routing_mask
+            if self.expert_routing_mask is not None
+            else self.routed_experts_for_cache
+        )
+        if routing_metadata is None:
+            return None
+
+        num_layers = routing_metadata.shape[1]
+        top_k = routing_metadata.shape[2]
+        metadata = torch.full(
+            (length, num_layers, top_k),
+            -1,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        mask_len = min(length, routing_metadata.shape[0])
+        if mask_len > 0:
+            metadata[:mask_len] = routing_metadata[:mask_len]
+        return metadata
+
+    def get_expert_routing_cache_metadata_source(self) -> Optional[str]:
+        if self.expert_routing_mask is not None:
+            return "supplied"
+        if self.routed_experts_for_cache is not None:
+            return "actual"
+        return None
+
     @property
     def output_ids_through_stop(self) -> List[int]:
         """Get the output ids through the stop condition. Stop position is included."""
@@ -1028,6 +1067,20 @@ class Req(ReqDllmMixin):
             token_ids = []
 
         if tree_cache is not None:
+            expert_routing_cache_metadata = None
+            expert_routing_cache_metadata_source = None
+            routing_cache_source = self.get_expert_routing_cache_metadata_source()
+            if routing_cache_source is not None:
+                if not getattr(tree_cache, "supports_expert_routing_mask", False):
+                    if self.expert_routing_mask is not None:
+                        max_prefix_len = 0
+                        token_ids = []
+                        self.skip_radix_cache_insert = True
+                else:
+                    expert_routing_cache_metadata = (
+                        self.get_expert_routing_cache_metadata(max_prefix_len)
+                    )
+                    expert_routing_cache_metadata_source = routing_cache_source
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
             match_result = tree_cache.match_prefix(
@@ -1035,6 +1088,8 @@ class Req(ReqDllmMixin):
                     key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                     req=self,
                     cow_mamba=cow_mamba,
+                    expert_routing_mask=expert_routing_cache_metadata,
+                    expert_routing_source=expert_routing_cache_metadata_source,
                 )
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -1458,6 +1513,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     extend_logprob_start_lens: List[int] = None
     # It comes empty list if logprob is not required.
     extend_input_logprob_token_ids: Optional[torch.Tensor] = None
+    expert_routing_mask: Optional[torch.Tensor] = None
 
     # For encoder-decoder architectures
     encoder_cached: Optional[List[bool]] = None
@@ -1768,6 +1824,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
+        has_expert_routing_mask = any(r.expert_routing_mask is not None for r in reqs)
+        expert_routing_mask_parts = []
+        expert_routing_num_layers = None
+        expert_routing_top_k = None
+        if has_expert_routing_mask:
+            expert_routing_num_layers = get_num_hidden_layers_from_config(
+                self.model_config
+            )
+            expert_routing_top_k = get_num_experts_per_tok_from_config(
+                self.model_config
+            )
+            if expert_routing_num_layers is None or expert_routing_top_k is None:
+                for req in reqs:
+                    if req.expert_routing_mask is not None:
+                        expert_routing_num_layers = req.expert_routing_mask.shape[1]
+                        expert_routing_top_k = req.expert_routing_mask.shape[2]
+                        break
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -1851,6 +1924,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlens_cpu,
                 )
 
+            if has_expert_routing_mask:
+                part = torch.full(
+                    (
+                        req.extend_input_len,
+                        expert_routing_num_layers,
+                        expert_routing_top_k,
+                    ),
+                    -1,
+                    dtype=torch.int32,
+                    pin_memory=_pin,
+                )
+                if req.expert_routing_mask is not None:
+                    prompt_mask_len = req.expert_routing_mask.shape[0]
+                    start = min(pre_len, prompt_mask_len)
+                    end = min(pre_len + req.extend_input_len, prompt_mask_len)
+                    if end > start:
+                        part[: end - start] = req.expert_routing_mask[start:end]
+                expert_routing_mask_parts.append(part)
+
             if self.return_logprob:
                 # Find input logprob token ids.
                 # First, find a global index within origin_input_ids and slide it by 1
@@ -1902,6 +1994,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids.clamp_(0, self.model_config.vocab_size - 1)
         else:
             extend_input_logprob_token_ids = None
+
+        if has_expert_routing_mask:
+            expert_routing_mask_tensor = torch.cat(expert_routing_mask_parts, dim=0)
+            self.expert_routing_mask = (
+                expert_routing_mask_tensor.to(self.device, non_blocking=True)
+                if torch.any(expert_routing_mask_tensor >= 0)
+                else None
+            )
+        else:
+            self.expert_routing_mask = None
 
         if has_replace_embeds:
             replace_embeds_tensor = torch.cat(all_replace_embeds, dim=0).to(
@@ -2087,6 +2189,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        if self.expert_routing_mask is not None:
+            decode_mask = torch.full(
+                (
+                    running_bs,
+                    self.expert_routing_mask.shape[1],
+                    self.expert_routing_mask.shape[2],
+                ),
+                -1,
+                dtype=self.expert_routing_mask.dtype,
+                device=self.expert_routing_mask.device,
+            )
+            self.expert_routing_mask = torch.cat(
+                [self.expert_routing_mask, decode_mask], dim=0
+            )
 
         self.merge_batch(running_batch)
         self.input_ids = input_ids
@@ -2289,6 +2405,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
+        self.expert_routing_mask = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -2579,6 +2696,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_prefix_lens=extend_prefix_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
             multimodal_inputs=self.multimodal_inputs,
+            expert_routing_mask=self.expert_routing_mask,
             encoder_cached=self.encoder_cached,
             encoder_lens=self.encoder_lens,
             encoder_lens_cpu=self.encoder_lens_cpu,
@@ -2643,6 +2761,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            expert_routing_mask=self.expert_routing_mask,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
@@ -2784,6 +2903,7 @@ class ModelWorkerBatch:
     extend_prefix_lens: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
     extend_input_logprob_token_ids: Optional[torch.Tensor]
+    expert_routing_mask: Optional[torch.Tensor]
 
     # For multimodal
     multimodal_inputs: Optional[List[MultimodalInputs]]

@@ -122,6 +122,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.expert_routing_mask import expert_routing_mask_context
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
@@ -3315,6 +3316,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         with (
             step_span_ctx,
+            expert_routing_mask_context(forward_batch.expert_routing_mask),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,

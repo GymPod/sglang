@@ -91,12 +91,18 @@ def match_prefix_for_req(
 ):
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
+    if req.expert_routing_mask is not None and not getattr(
+        tree_cache, "supports_expert_routing_mask", False
+    ):
+        token_ids = []
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
             key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
+            expert_routing_mask=req.get_expert_routing_cache_metadata(len(token_ids)),
+            expert_routing_source=req.get_expert_routing_cache_metadata_source(),
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -251,7 +257,13 @@ class SchedulePolicy:
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 match_result = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
+                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
+                        expert_routing_mask=r.get_expert_routing_cache_metadata(
+                            len(prefix_ids)
+                        ),
+                        expert_routing_source=(
+                            r.get_expert_routing_cache_metadata_source()
+                        ),
                     )
                 )
                 if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -270,6 +282,12 @@ class SchedulePolicy:
                         InsertParams(
                             key=RadixKey(token_ids=prefix_ids, extra_key=extra_key),
                             value=torch.empty(len(prefix_ids), dtype=torch.bool),
+                            expert_routing_mask=r.get_expert_routing_cache_metadata(
+                                len(prefix_ids)
+                            ),
+                            expert_routing_source=(
+                                r.get_expert_routing_cache_metadata_source()
+                            ),
                         )
                     )
         return temporary_deprioritized

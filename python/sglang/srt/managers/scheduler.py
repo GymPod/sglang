@@ -76,6 +76,12 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
 )
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe.expert_routing_mask import (
+    decode_expert_routing_mask,
+    get_num_experts_from_config,
+    get_num_experts_per_tok_from_config,
+    get_num_hidden_layers_from_config,
+)
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
@@ -1996,6 +2002,43 @@ class Scheduler(
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
 
+        if session_id is not None and recv_req.expert_routing_mask is not None:
+            req = Req(
+                recv_req.rid,
+                recv_req.input_text,
+                recv_req.input_ids,
+                recv_req.sampling_params,
+                vocab_size=self.model_config.vocab_size,
+                http_worker_ipc=recv_req.http_worker_ipc,
+            )
+            req.tokenizer = self.tokenizer
+            req.set_finish_with_abort(
+                "expert_routing_mask is not supported for session requests."
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if recv_req.expert_routing_mask is not None and (
+            recv_req.input_text is not None or recv_req.input_embeds is not None
+        ):
+            req = Req(
+                recv_req.rid,
+                recv_req.input_text,
+                recv_req.input_ids,
+                recv_req.sampling_params,
+                vocab_size=self.model_config.vocab_size,
+                http_worker_ipc=recv_req.http_worker_ipc,
+            )
+            req.tokenizer = self.tokenizer
+            req.set_finish_with_abort(
+                "expert_routing_mask requires input_ids and is not supported for "
+                "text, chat, or input_embeds requests."
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         if session_id is None:
             # Normal non-session request
             if recv_req.input_embeds is not None:
@@ -2027,6 +2070,7 @@ class Scheduler(
                 return_routed_experts=recv_req.return_routed_experts,
                 routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_indexer_topk=recv_req.return_indexer_topk,
+                expert_routing_mask=recv_req.expert_routing_mask,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -2156,6 +2200,33 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        if recv_req.expert_routing_mask is not None:
+            num_layers = get_num_hidden_layers_from_config(self.model_config)
+            top_k = get_num_experts_per_tok_from_config(self.model_config)
+            num_experts = get_num_experts_from_config(self.model_config)
+            if num_layers is None or top_k is None:
+                req.set_finish_with_abort(
+                    "expert_routing_mask requires a MoE model config with "
+                    "num_hidden_layers and num_experts_per_tok."
+                )
+                self._add_request_to_queue(req)
+                return
+            try:
+                req.expert_routing_mask = decode_expert_routing_mask(
+                    recv_req.expert_routing_mask,
+                    prompt_len=len(req.origin_input_ids),
+                    num_layers=num_layers,
+                    top_k=top_k,
+                    num_experts=num_experts,
+                )
+            except ValueError as exc:
+                req.set_finish_with_abort(str(exc))
+                self._add_request_to_queue(req)
+                return
+
+            if not getattr(self.tree_cache, "supports_expert_routing_mask", False):
+                req.skip_radix_cache_insert = True
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
@@ -2444,6 +2515,7 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
+        self.maybe_collect_routed_experts_for_cache(req)
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
     def _build_hisparse_decode_batch(self, reqs):

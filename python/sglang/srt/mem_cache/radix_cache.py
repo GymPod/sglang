@@ -63,6 +63,15 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
+EXPERT_ROUTING_CHILD_KEY_TAG = "__sglang_expert_routing__"
+EXPERT_ROUTING_SOURCE_ACTUAL = "actual"
+EXPERT_ROUTING_SOURCE_SUPPLIED = "supplied"
+EXPERT_ROUTING_SOURCES = {
+    EXPERT_ROUTING_SOURCE_ACTUAL,
+    EXPERT_ROUTING_SOURCE_SUPPLIED,
+}
+
+
 class RadixKey:
     """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
 
@@ -226,6 +235,9 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        # Optional per-token MoE routing metadata for this node's key segment.
+        self.expert_routing_mask: Optional[torch.Tensor] = None
+        self.expert_routing_source: Optional[str] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -267,6 +279,8 @@ class TreeNode:
 
 
 class RadixCache(KVCacheEventMixin, BasePrefixCache):
+    supports_expert_routing_mask = True
+
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
@@ -340,6 +354,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.root_node.key = RadixKey(token_ids=[], extra_key=None)
         self.root_node.value = []
         self.root_node.host_value = []
+        self.root_node.expert_routing_mask = None
+        self.root_node.expert_routing_source = None
         self.root_node.lock_ref = 1
         self.root_node.hash_value = []
         self.evictable_size_ = 0
@@ -395,17 +411,25 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 subsequent match efficiency and does not duplicate data.
         """
         key = params.key
-        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        expert_routing_mask = params.expert_routing_mask
+        key, expert_routing_mask = key.maybe_to_bigram_view(
+            self.is_eagle, expert_routing_mask
+        )
 
         if self.disable or len(key) == 0:
             return self._empty_match_result
 
         key = key.page_aligned(self.page_size)
+        expert_routing_mask = self._page_align_expert_routing_mask(
+            expert_routing_mask, len(key)
+        )
 
         if len(key) == 0:
             return self._empty_match_result
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
+        value, last_node = self._match_prefix_helper(
+            self.root_node, key, expert_routing_mask
+        )
         if value:
             value = torch.cat(value)
         else:
@@ -425,16 +449,34 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         value = params.value
         priority = params.priority
         chunked = params.chunked
+        expert_routing_mask = params.expert_routing_mask
+        expert_routing_source = params.expert_routing_source
 
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+        if expert_routing_mask is not None and self.is_eagle:
+            expert_routing_mask = expert_routing_mask[: len(key)]
         key = key.page_aligned(self.page_size)
+        expert_routing_mask = self._page_align_expert_routing_mask(
+            expert_routing_mask, len(key)
+        )
+        expert_routing_source = self._normalize_expert_routing_source(
+            expert_routing_mask, expert_routing_source
+        )
         if value is not None:
             value = value[: len(key)]
         else:
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
+        prefix_len = self._insert_helper(
+            self.root_node,
+            key,
+            value,
+            priority,
+            chunked,
+            expert_routing_mask,
+            expert_routing_source,
+        )
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
@@ -466,7 +508,17 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    priority=priority,
+                    expert_routing_mask=req.get_expert_routing_cache_metadata(
+                        len(radix_key)
+                    ),
+                    expert_routing_source=(
+                        req.get_expert_routing_cache_metadata_source()
+                    ),
+                )
             )
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
@@ -506,6 +558,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 value=values,
                 chunked=chunked,
                 priority=getattr(req, "priority", 0) or 0,
+                expert_routing_mask=req.get_expert_routing_cache_metadata(
+                    len(radix_key)
+                ),
+                expert_routing_source=req.get_expert_routing_cache_metadata_source(),
             )
         )
         new_prefix_len = result.prefix_len
@@ -515,7 +571,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        match_result = self.match_prefix(
+            MatchPrefixParams(
+                key=radix_key,
+                expert_routing_mask=req.get_expert_routing_cache_metadata(
+                    len(radix_key)
+                ),
+                expert_routing_source=req.get_expert_routing_cache_metadata_source(),
+            )
+        )
         new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
@@ -642,19 +706,169 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+    def _page_align_expert_routing_mask(
+        self, expert_routing_mask: Optional[torch.Tensor], key_len: int
+    ) -> Optional[torch.Tensor]:
+        if expert_routing_mask is None:
+            return None
+        if expert_routing_mask.shape[0] < key_len:
+            raise ValueError(
+                "expert_routing_mask metadata is shorter than the radix key: "
+                f"{expert_routing_mask.shape[0]} < {key_len}."
+            )
+        return (
+            expert_routing_mask[:key_len]
+            .to(device="cpu", dtype=torch.int32)
+            .contiguous()
+        )
+
+    @staticmethod
+    def _slice_expert_routing_mask(
+        expert_routing_mask: Optional[torch.Tensor],
+        start: int,
+        end: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
+        if expert_routing_mask is None:
+            return None
+        return expert_routing_mask[start:end].clone()
+
+    @staticmethod
+    def _expert_routing_signature(
+        expert_routing_mask: Optional[torch.Tensor],
+    ) -> Optional[bytes]:
+        if expert_routing_mask is None:
+            return None
+        if expert_routing_mask.shape[0] == 0:
+            return None
+        return hashlib.sha256(
+            expert_routing_mask.detach().cpu().contiguous().numpy().tobytes()
+        ).digest()
+
+    def _child_key(
+        self, key: RadixKey, expert_routing_mask: Optional[torch.Tensor]
+    ):
+        base_key = key.child_key(self.page_size)
+        if expert_routing_mask is None:
+            return base_key
+        page_len = min(self.page_size, len(key))
+        signature = self._expert_routing_signature(expert_routing_mask[:page_len])
+        return (EXPERT_ROUTING_CHILD_KEY_TAG, base_key, signature)
+
+    @staticmethod
+    def _is_expert_routing_child_key(child_key: Any) -> bool:
+        return (
+            isinstance(child_key, tuple)
+            and len(child_key) == 3
+            and child_key[0] == EXPERT_ROUTING_CHILD_KEY_TAG
+        )
+
+    @staticmethod
+    def _normalize_expert_routing_source(
+        expert_routing_mask: Optional[torch.Tensor],
+        expert_routing_source: Optional[str],
+    ) -> Optional[str]:
+        if expert_routing_mask is None:
+            return None
+        if expert_routing_source is None:
+            return EXPERT_ROUTING_SOURCE_SUPPLIED
+        if expert_routing_source not in EXPERT_ROUTING_SOURCES:
+            raise ValueError(
+                f"Invalid expert_routing_source: {expert_routing_source!r}."
+            )
+        return expert_routing_source
+
+    @staticmethod
+    def _merge_expert_routing_source(
+        node: TreeNode, expert_routing_source: Optional[str]
+    ) -> None:
+        if node.expert_routing_mask is None or expert_routing_source is None:
+            return
+        if (
+            node.expert_routing_source == EXPERT_ROUTING_SOURCE_ACTUAL
+            or expert_routing_source == EXPERT_ROUTING_SOURCE_ACTUAL
+        ):
+            node.expert_routing_source = EXPERT_ROUTING_SOURCE_ACTUAL
+        else:
+            node.expert_routing_source = EXPERT_ROUTING_SOURCE_SUPPLIED
+
+    def _match_child(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        expert_routing_mask: Optional[torch.Tensor],
+    ) -> Optional[TreeNode]:
+        if expert_routing_mask is not None:
+            return node.children.get(self._child_key(key, expert_routing_mask))
+
+        base_key = key.child_key(self.page_size)
+        child = node.children.get(base_key)
+        if child is not None:
+            return child
+
+        for child_key, candidate in node.children.items():
+            if (
+                self._is_expert_routing_child_key(child_key)
+                and child_key[1] == base_key
+                and candidate.expert_routing_source == EXPERT_ROUTING_SOURCE_ACTUAL
+            ):
+                return candidate
+        return None
+
+    def _expert_routing_match_len(
+        self,
+        stored: Optional[torch.Tensor],
+        query: Optional[torch.Tensor],
+        max_len: int,
+        stored_source: Optional[str],
+    ) -> int:
+        if query is None:
+            if stored is None or stored_source == EXPERT_ROUTING_SOURCE_ACTUAL:
+                return max_len
+            return 0
+        if stored is None:
+            return 0
+        compare_len = min(max_len, stored.shape[0], query.shape[0])
+        if compare_len == 0:
+            return 0
+        mismatch = (stored[:compare_len] != query[:compare_len]).view(
+            compare_len, -1
+        ).any(dim=1)
+        mismatch_indices = torch.nonzero(mismatch, as_tuple=False)
+        if mismatch_indices.numel() == 0:
+            match_len = compare_len
+        else:
+            match_len = int(mismatch_indices[0].item())
+        if self.page_size > 1:
+            match_len = (match_len // self.page_size) * self.page_size
+        return match_len
+
+    def _match_prefix_helper(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        expert_routing_mask: Optional[torch.Tensor],
+    ):
         access_time = time.monotonic()
         node.last_access_time = access_time
 
-        child_key = key.child_key(self.page_size)
-
         value = []
-        while len(key) > 0 and child_key in node.children.keys():
-            child = node.children[child_key]
+        child = self._match_child(node, key, expert_routing_mask)
+        while len(key) > 0 and child is not None:
             child.last_access_time = access_time
             prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = min(
+                prefix_len,
+                self._expert_routing_match_len(
+                    child.expert_routing_mask,
+                    expert_routing_mask,
+                    prefix_len,
+                    child.expert_routing_source,
+                ),
+            )
+            if prefix_len == 0:
+                break
             if prefix_len < len(child.key):
-                new_node = self._split_node(child.key, child, prefix_len)
+                new_node = self._split_node(child, prefix_len)
                 value.append(new_node.value)
                 node = new_node
                 break
@@ -662,26 +876,42 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 value.append(child.value)
                 node = child
                 key = key[prefix_len:]
+                expert_routing_mask = self._slice_expert_routing_mask(
+                    expert_routing_mask, prefix_len
+                )
 
                 if len(key):
-                    child_key = key.child_key(self.page_size)
+                    child = self._match_child(node, key, expert_routing_mask)
+                else:
+                    child = None
 
         return value, node
 
-    def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
+    def _split_node(self, child: TreeNode, split_len: int):
         # new_node -> child
         # New node inherits child's priority (represents shared prefix)
+        original_expert_routing_mask = child.expert_routing_mask
+        old_child_key = self._child_key(child.key, original_expert_routing_mask)
         new_node = TreeNode(priority=child.priority)
         new_node.hit_count = child.hit_count
-        new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        new_node.expert_routing_mask = self._slice_expert_routing_mask(
+            original_expert_routing_mask, 0, split_len
+        )
+        new_node.expert_routing_source = child.expert_routing_source
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
-        new_node.parent.children[key.child_key(self.page_size)] = new_node
+        child.expert_routing_mask = self._slice_expert_routing_mask(
+            original_expert_routing_mask, split_len
+        )
+        new_node.children = {
+            self._child_key(child.key, child.expert_routing_mask): child
+        }
+        new_node.parent.children[old_child_key] = new_node
 
         # Split hash_value if it was already computed, otherwise leave as None
         new_node.hash_value, child.hash_value = split_node_hash_value(
@@ -705,6 +935,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         value,
         priority: int = 0,
         chunked: bool = False,
+        expert_routing_mask: Optional[torch.Tensor] = None,
+        expert_routing_source: Optional[str] = None,
     ):
         # Convert None priority to 0
         if priority is None:
@@ -716,33 +948,53 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(key) == 0:
             return 0
 
-        child_key = key.child_key(self.page_size)
+        child_key = self._child_key(key, expert_routing_mask)
 
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = access_time
             prefix_len = node.key.match(key, page_size=self.page_size)
+            prefix_len = min(
+                prefix_len,
+                self._expert_routing_match_len(
+                    node.expert_routing_mask,
+                    expert_routing_mask,
+                    prefix_len,
+                    node.expert_routing_source,
+                ),
+            )
+            if prefix_len == 0:
+                break
             total_prefix_length += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
+            expert_routing_mask = self._slice_expert_routing_mask(
+                expert_routing_mask, prefix_len
+            )
 
             if prefix_len < len(node.key):
-                new_node = self._split_node(node.key, node, prefix_len)
+                new_node = self._split_node(node, prefix_len)
                 new_node.priority = max(new_node.priority, priority)
                 self._inc_hit_count(new_node, chunked)
+                self._merge_expert_routing_source(new_node, expert_routing_source)
                 node = new_node
             else:
                 node.priority = max(node.priority, priority)
                 self._inc_hit_count(node, chunked)
+                self._merge_expert_routing_source(node, expert_routing_source)
             if len(key):
-                child_key = key.child_key(self.page_size)
+                child_key = self._child_key(key, expert_routing_mask)
 
         if len(key):
             new_node = TreeNode(priority=priority)
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            new_node.expert_routing_mask = self._slice_expert_routing_mask(
+                expert_routing_mask, 0
+            )
+            new_node.expert_routing_source = expert_routing_source
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
@@ -766,12 +1018,12 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             for key, child in current_node.children.items():
                 stack.append((child, current_indent + 2))
 
-                assert key == child.key.child_key(
-                    self.page_size
-                ), f"{key=}, {child.key.child_key(self.page_size)=}"
+                assert key == self._child_key(
+                    child.key, child.expert_routing_mask
+                ), f"{key=}, {self._child_key(child.key, child.expert_routing_mask)=}"
 
     def _delete_leaf(self, node):
-        key = node.key.child_key(self.page_size)
+        key = self._child_key(node.key, node.expert_routing_mask)
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 

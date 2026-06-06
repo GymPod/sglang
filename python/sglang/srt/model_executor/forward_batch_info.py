@@ -334,6 +334,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    expert_routing_mask: Optional[torch.Tensor] = None
 
     # For split prefill
     # intermediate values for split prefill
@@ -490,6 +491,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
             rids=[req.rid for req in batch.reqs],
+            expert_routing_mask=batch.expert_routing_mask,
         )
         device = model_runner.device
 

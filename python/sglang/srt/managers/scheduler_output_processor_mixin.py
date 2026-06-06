@@ -126,12 +126,15 @@ class SchedulerOutputProcessorMixin:
         if capturer is None:
             return
         start_len = req.routed_experts_start_len
-        req.routed_experts = capturer.get_topk(
-            req_pool_idx=req.req_pool_idx,
-            seqlen=req.seqlen,
-            req_to_token_pool=self.req_to_token_pool,
-            start_len=start_len,
-        )
+        if start_len == 0 and req.routed_experts_for_cache is not None:
+            req.routed_experts = req.routed_experts_for_cache
+        else:
+            req.routed_experts = capturer.get_topk(
+                req_pool_idx=req.req_pool_idx,
+                seqlen=req.seqlen,
+                req_to_token_pool=self.req_to_token_pool,
+                start_len=start_len,
+            )
 
         expected_rows = max(0, req.seqlen - 1 - start_len)
         if (
@@ -149,6 +152,20 @@ class SchedulerOutputProcessorMixin:
                 req.cached_tokens,
                 req.routed_experts_start_len,
             )
+
+    def maybe_collect_routed_experts_for_cache(self: Scheduler, req: Req):
+        """Collect natural MoE routes for routing-aware KV cache insertion."""
+        if req.expert_routing_mask is not None or not req.return_routed_experts:
+            return
+        capturer = get_global_experts_capturer()
+        if capturer is None:
+            return
+        req.routed_experts_for_cache = capturer.get_topk(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+            start_len=0,
+        )
 
     def maybe_collect_indexer_topk(self: Scheduler, req: Req):
         capturer = get_global_indexer_capturer()
@@ -250,6 +267,7 @@ class SchedulerOutputProcessorMixin:
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
                     req.check_finished()
+                    self.maybe_collect_routed_experts_for_cache(req)
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         self.maybe_collect_indexer_topk(req)
@@ -644,6 +662,7 @@ class SchedulerOutputProcessorMixin:
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
+            self.maybe_collect_routed_experts_for_cache(req)
             self.maybe_collect_routed_experts(req)
             self.maybe_collect_indexer_topk(req)
 

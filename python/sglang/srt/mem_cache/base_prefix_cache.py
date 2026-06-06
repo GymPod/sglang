@@ -45,6 +45,11 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # Optional per-token MoE expert routing metadata. A cache that supports this
+    # must only return KV entries whose metadata matches the request prefix.
+    expert_routing_mask: Optional[torch.Tensor] = None
+    expert_routing_source: Optional[str] = None
+
 
 @dataclasses.dataclass
 class InsertParams:
@@ -63,6 +68,8 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    expert_routing_mask: Optional[torch.Tensor] = None
+    expert_routing_source: Optional[str] = None
 
 
 @dataclasses.dataclass

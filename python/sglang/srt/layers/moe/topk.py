@@ -54,6 +54,10 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe.expert_routing_mask import (
+    apply_expert_routing_mask,
+    has_current_expert_routing_mask,
+)
 from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -383,6 +387,16 @@ class TopK(MultiPlatformOp):
             output_format = TopKOutputFormat.BYPASSED
         else:
             output_format = TopKOutputFormat.STANDARD
+
+        if has_current_expert_routing_mask() and output_format in (
+            TopKOutputFormat.TRITON_KERNEL,
+            TopKOutputFormat.BYPASSED,
+        ):
+            raise RuntimeError(
+                "expert_routing_mask requires explicit top-k routing. The current "
+                f"MoE backend selected {output_format.name}, which routes inside a "
+                "fused backend and cannot be safely constrained by supplied experts."
+            )
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False
@@ -1312,6 +1326,8 @@ def select_experts(
     )
 
     scoring_func = topk_config.scoring_func
+
+    router_logits = apply_expert_routing_mask(router_logits, layer_id)
 
     (
         router_logits,
