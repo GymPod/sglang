@@ -261,36 +261,39 @@ if _HAVE_TRITON:
         kb = tl.load(kb_ptr + ((ar * CS + r[:, None]) * HV + h) * Dk + dk[None, :], mask=valid[:, None], other=0.0)
         vb = tl.load(vb_ptr + ((ar * CS + r[:, None]) * HV + h) * Dv + dv[None, :], mask=valid[:, None], other=0.0)
         gcum = tl.load(gcum_ptr + base + r, mask=valid, other=0.0)
-        # Everything below places the new token at ROW i of a full CS=64 tile (row_i mask), matching
-        # _chunk_scan_kernel's tile geometry so the tf32 (SPREC) dots accumulate bit-identically to the
-        # scan (tf32 tensor-core reductions are only tile-shape reproducible; the old QR=16 tiles put
-        # the token at row 0 of a 16-high tile and diverged ~6e-4). The ieee WY-prep dots (A, T-append,
-        # val, kcd) are M-tile invariant so they stay bit-identical to prefill's aten bmm regardless.
+        # The SPREC (tf32) dots below place the new token at ROW i of a full CS=64 tile (row_i mask),
+        # matching _chunk_scan_kernel's tile geometry so the tf32 tensor-core reductions accumulate
+        # bit-identically to the scan (tf32 is only tile-shape reproducible; a QR=16 SPREC tile puts
+        # the token at row 0 of a 16-high MMA and diverges ~6e-4). The four ieee WY-prep dots (A,
+        # T-append, val, kcd) run on FMA units (no B200 tensor-core ieee path), so each output element
+        # is an independent K-reduction and the M-tile HEIGHT does not change any accumulation. Only
+        # row i of each is meaningful, so they are collapsed to a [QR=16,K] tile (row 0 = the row-i
+        # operand) -- the exact trick _fwd_sub_kernel uses (0 ULP, num_warps-invariant), 4x less dot
+        # work. The resulting row-i vectors are rebuilt into [CS,*] tiles before the SPREC dots.
+        QR: tl.constexpr = 16
+        qr = tl.arange(0, QR)
+        qr0 = qr[:, None] == 0
         # --- A row i = -(kb[i] @ kn^T) * exp(gcum[i]-gcum[j]) for j<i (strictly-lower) ---
         # Use the RELOADED kb[i] (kb_ri), NOT the kb_i register (= kn_i*beta): feeding the register
         # into the dot lets the compiler carry kn_i's pre-bf16-cast precision into the matmul, so the
         # A entries land ~4e-5 off prefill's aten bmm (which consumes the stored, bf16-rounded kb).
-        # Build the decay as the full 2D exp(gcum[a]-gcum[b]) from the reloaded gcum tile, the exact
-        # expression prefill's decay_mask (and the core `decay` below) uses. Both mismatches are
-        # invisible under ieee (the solve/scan absorb them) but tf32 truncates each dot input, so they
-        # amplify through T -> v_solved -> intra (~1e-3 decode-vs-prefill) unless matched here.
-        decay_full = libdevice.exp(gcum[:, None] - gcum[None, :])  # [CS,CS]
+        # decay_i[j]=exp(gcum[i]-gcum[j]) is row i of prefill's full 2D decay_mask; multiplying the
+        # collapsed dot row by it elementwise equals extracting row i of (-dot)*decay_full.
+        gcum_i = tl.sum(tl.where(r == i, gcum, 0.0), 0)  # scalar gcum[i], single-lane collapse
         kb_ri = tl.sum(tl.where(row_i, kb, 0.0), 0)  # reloaded kb[i], single-lane collapse
-        kb_tile = tl.where(row_i, kb_ri[None, :], 0.0)  # [CS,Dk], row i = kb[i]
-        kept2 = (r[:, None] > r[None, :]) & valid[None, :]  # strictly-lower, cols valid
-        decay_a = tl.where(kept2, decay_full, 0.0)  # [CS,CS]
-        A = -tl.dot(kb_tile, tl.trans(kn), input_precision="ieee") * decay_a
+        kb16 = tl.where(qr0, kb_ri[None, :], 0.0)  # [QR,Dk], row 0 = kb[i]
+        Aval = tl.sum(tl.where(qr0, -tl.dot(kb16, tl.trans(kn), input_precision="ieee"), 0.0), 0)  # [CS]
+        decay_i = libdevice.exp(gcum_i - gcum)  # [CS] = exp(gcum[i]-gcum[j])
         kept = (i > r) & valid
-        A = tl.where(kept[None, :], A, 0.0)
-        Arow = tl.sum(tl.where(row_i, A, 0.0), 0)  # [CS] tile row i
+        Arow = tl.where(kept, Aval * decay_i, 0.0)  # [CS] strictly-lower row i
         tl.store(A_ptr + base + r, Arow)
         # --- append forward-substitution row: T[i,j<i] = A[i,j] + sum_{m<i} A[i,m]*T[m,j] ---
         # Same tl.dot formulation as _fwd_sub_kernel (bit-identical to prefill, num_warps-invariant).
         M = tl.load(T_ptr + (base + r[:, None]) * CS + r[None, :])  # cached final rows m<i
         a_im = tl.where(r < i, Arow, 0.0)  # [C], zero for m>=i
-        lhs = tl.where(row_i, a_im[None, :], 0.0)  # [C,C], row i = a_im
-        accfull = tl.dot(lhs, M, input_precision="ieee")  # [C,C], row i = sum_m a_im[m]*M[m,j]
-        acc = tl.sum(tl.where(row_i, accfull, 0.0), 0)  # [C(j)]
+        lhs = tl.where(qr0, a_im[None, :], 0.0)  # [QR,C], row 0 = a_im (matches _fwd_sub_kernel)
+        accfull = tl.dot(lhs, M, input_precision="ieee")  # [QR,C], row 0 = sum_m a_im[m]*M[m,j]
+        acc = tl.sum(tl.where(qr0, accfull, 0.0), 0)  # [C(j)]
         Tnew = tl.where(r < i, Arow + acc, Arow)  # T[i,:] (strictly-lower part filled)
         tl.store(T_ptr + (base + i) * CS + r, Tnew)
         # --- core row i = attn_inter[i] + attn2[i,:] @ v_new, caching v_new[i] and optional Snew ---
@@ -299,17 +302,22 @@ if _HAVE_TRITON:
         S = tl.load(S_ptr + (ar * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :])
         Trow = tl.load(T_ptr + (base + i) * CS + r)
         Trow = Trow + tl.where(r == i, 1.0, 0.0)  # + eye row i
-        Ttile = tl.where(row_i, Trow[None, :], 0.0)  # [CS,CS], row i = Trow
-        val = tl.dot(Ttile, vb, input_precision="ieee")  # [CS,Dv], row i = T[i,:]@vb
+        # val=T[i,:]@vb and kcd=T[i,:]@(kb*exp g) are ieee (FMA, K-dim reduction over CS rows): only
+        # row i is meaningful and the reduction is M-tile invariant, so collapse to a [QR,CS] tile
+        # (row 0 = Trow) exactly like the A/T-append dots. kcd is then rebuilt into the [CS,Dk] tile
+        # the SPREC vprime dot needs (SPREC keeps CS=64 geometry).
+        Trow16 = tl.where(qr0, Trow[None, :], 0.0)  # [QR,CS], row 0 = Trow
+        val_i = tl.sum(tl.where(qr0, tl.dot(Trow16, vb, input_precision="ieee"), 0.0), 0)  # [Dv] T[i,:]@vb
         kg = kb * libdevice.exp(gcum)[:, None]  # [CS,Dk]
-        kcd = tl.dot(Ttile, kg, input_precision="ieee")  # [CS,Dk], row i = T[i,:]@(kb*exp g)
+        kcd_i = tl.sum(tl.where(qr0, tl.dot(Trow16, kg, input_precision="ieee"), 0.0), 0)  # [Dk] T[i,:]@(kb*exp g)
+        kcd = tl.where(row_i, kcd_i[None, :], 0.0)  # [CS,Dk], row i = kcd_i (for the SPREC dot)
         # Mirror _chunk_scan_kernel's core exactly, incl the `bar` rounding barrier (data-dependent so
         # the compiler cannot fold the following add/sub into an accumulator-form FMA). The scan and
         # this step must fold in the identical order for tf32 decode==prefill.
         bar = tl.sum(tl.where(r == 0, gcum, 0.0), 0) < 1e30  # always true, not provably so
         vprime = tl.where(bar, tl.dot(kcd, S, input_precision=SPREC), 0.0)  # [CS,Dv] k_cumdecay@S
-        vnew_tile = val - vprime  # [CS,Dv]
-        vnew_row = tl.sum(tl.where(row_i, vnew_tile, 0.0), 0)  # [Dv] v_new[i]
+        vprime_row = tl.sum(tl.where(row_i, vprime, 0.0), 0)  # [Dv] row i (bar-rounded)
+        vnew_row = val_i - vprime_row  # [Dv] v_new[i] = val[i] - vprime[i]
         vn_cached = tl.load(vnew_ptr + (base + r[:, None]) * Dv + dv[None, :], mask=(r < i)[:, None], other=0.0)
         vnew_full = tl.where(row_i, vnew_row[None, :], vn_cached)  # [CS,Dv] rows 0..i
         qn = tl.load(qn_ptr + ((ar * CS + i) * HV + h) * Dk + dk)  # [Dk] row-i query
