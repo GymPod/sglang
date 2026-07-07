@@ -172,6 +172,58 @@ if _HAVE_TRITON:
             M = tl.where(r[:, None] == i, new_row[None, :], M)
         tl.store(base + r[:, None] * C + r[None, :], M)
 
+    @triton.jit
+    def _gdn_conv_update_kernel(
+        cs_ptr, mq_ptr, w_ptr, bias_ptr, cidx_ptr, act_ptr,  # conv_states [slots,D,SL], mixed_qkv [B,D]
+        D, SL, S_slot, S_d,                                  # conv_states strides (slot, D)
+        K: tl.constexpr, BLK: tl.constexpr, HAS_BIAS: tl.constexpr,
+        PAD_SLOT: tl.constexpr, PAD_ROW: tl.constexpr,
+    ):
+        # Fused batch-invariant decode conv update: for each (batch row b, D-tile), gather this
+        # slot's SL cached pre-conv columns, causal-depthwise-conv with the current token as the last
+        # column, and roll conv_states left in place (drop oldest, append the current column). Writes
+        # the fp32 PRE-silu conv output to act[b] (the caller applies F.silu -- torch's fused silu is
+        # ~1 bf16 ULP off any elementwise x*sigmoid(x), so silu MUST stay in torch to bit-match
+        # Megatron's F.silu). Replaces the ~15 tiny per-layer kernels (index-gather + cat + 3x float
+        # + K-tap conv + slice + cast + scatter) the eager block launched -- one launch per layer.
+        #
+        # fp32 MAC in EXACT tap order k=0..K-1 then bias, mul-then-add (bit-identical to the torch
+        # _causal_depthwise_conv1d reference: verified 0 ULP on the pre-silu conv). Fixed-shape /
+        # capture-safe: all B rows processed, indexed directly by cache_indices. PAD slots
+        # (cache_indices == -1, PAD_SLOT) index the reserved dummy row 0 (PAD_ROW == 0; the pool free
+        # list is arange(1, size+1) so row 0 is never allocated to a live request); their output is
+        # GDN-zeroed downstream, and the in-place roll of the shared pad row is harmless scratch.
+        # Distinct real decode slots => no cross-program write hazard on the roll.
+        b = tl.program_id(0)
+        d = tl.program_id(1) * BLK + tl.arange(0, BLK)
+        dm = d < D
+        slot = tl.load(cidx_ptr + b)
+        # Map PAD_SLOT (-1) to the reserved dummy row 0 (PAD_ROW == 0; never a live slot). Torch's
+        # fancy index used negative wraparound; raw pointer math needs the explicit positive row.
+        slot = tl.where(slot == PAD_SLOT, PAD_ROW, slot)
+        sbase = slot * S_slot + d * S_d
+        xcur = tl.load(mq_ptr + b * D + d, mask=dm, other=0.0).to(tl.float32)
+        acc = tl.zeros([BLK], tl.float32)
+        for k in range(K):
+            wk = tl.load(w_ptr + d * K + k, mask=dm, other=0.0).to(tl.float32)
+            if k < SL:
+                xk = tl.load(cs_ptr + sbase + k, mask=dm, other=0.0).to(tl.float32)
+            else:
+                xk = xcur
+            acc = acc + xk * wk  # rounded fp32 mul then rounded fp32 add, tap order fixed
+        if HAS_BIAS:
+            acc = acc + tl.load(bias_ptr + d, mask=dm, other=0.0).to(tl.float32)
+        tl.store(act_ptr + b * D + d, acc, mask=dm)  # fp32 pre-silu; caller does F.silu(.).to(dtype)
+        # Roll conv_states left in place: new[:, j] = prev[:, j+1] for j<SL-1, new[:, SL-1] = xcur.
+        # All source columns were already read into registers above (acc loop), so writing them back
+        # is not a read-after-write hazard within this program.
+        for j in range(SL):
+            if j < SL - 1:
+                v = tl.load(cs_ptr + sbase + (j + 1), mask=dm, other=0.0)
+            else:
+                v = tl.load(mq_ptr + b * D + d, mask=dm, other=0.0)
+            tl.store(cs_ptr + sbase + j, v.to(cs_ptr.dtype.element_ty), mask=dm)
+
     # ----- Incremental (O(1)-row/step) chunk-replay decode kernels -----
     # Each decode step appends ONE token to the partial chunk. A's / T's / v_new's leading blocks
     # are constant across steps (old tokens' prep + stable gcum prefix), so only row i=W-1 is new.
@@ -525,6 +577,29 @@ def _fused_chunk_scan(query, key, gcum, v_solved, k_cumdecay, s_init, nchunks, b
         num_warps=8, num_stages=1,
     )
     return core, last, (bnd if want_boundary else None)
+
+
+def _fused_gdn_conv_update(conv_states, mixed_qkv, weight, bias, cache_indices, pad_slot):
+    """Fused batch-invariant decode conv update in ONE launch, replacing the eager index-gather +
+    cat + fp32 conv + slice + cast + scatter chain (~15 tiny kernels/layer). Runs the causal
+    depthwise conv (fp32, fixed tap order) and rolls conv_states left in place, returning the fp32
+    PRE-silu activation [B, D]. The caller applies F.silu then casts to bf16 -- torch's fused F.silu
+    is ~1 bf16 ULP off any elementwise x*sigmoid(x), so silu stays in torch to bit-match Megatron.
+    conv_states: [slots, D, SL] bf16; mixed_qkv: [B, D]; weight: [D, K] (K = SL + 1); bias: [D] or
+    None. Bit-identical to the eager block (conv fp32 MAC + rolled states verified 0 ULP)."""
+    B, D = mixed_qkv.shape
+    SL = conv_states.shape[-1]
+    K = weight.shape[-1]
+    assert K == SL + 1, f"conv width {K} must be state_len {SL} + 1"
+    act = torch.empty(B, D, device=mixed_qkv.device, dtype=torch.float32)
+    BLK = 256
+    pad_row = 0  # reserved dummy row 0 (mamba pool free list is arange(1, size+1); row 0 never live)
+    _gdn_conv_update_kernel[(B, triton.cdiv(D, BLK))](
+        conv_states, mixed_qkv, weight, bias if bias is not None else mixed_qkv, cache_indices, act,
+        D, SL, conv_states.stride(0), conv_states.stride(1),
+        K=K, BLK=BLK, HAS_BIAS=bias is not None, PAD_SLOT=pad_slot, PAD_ROW=pad_row, num_warps=4,
+    )
+    return act
 
 
 def _solve_fwd_sub(attn: torch.Tensor) -> torch.Tensor:
@@ -1498,44 +1573,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         assert isinstance(mixed_qkv, torch.Tensor)
         if is_batch_invariant_mode_enabled():
-            # Deterministic fixed-order fp32 conv to bit-match Megatron's batch-invariant
-            # path (gated_delta_net.py: _causal_depthwise_conv1d in fp32, fp32 silu, then
-            # cast to bf16). The fused causal_conv1d_update CUDA kernel accumulates the
-            # 4-tap FMA in a different order and diverges by ~1 bf16 ULP on the current
-            # token even when all inputs (current token + cached columns) are bit-identical.
-            # mixed_qkv is [B, dim] (one decode token); conv_states is [slots, dim, state_len]
-            # holding the state_len (=width-1) preceding raw pre-conv columns, oldest first.
+            # Deterministic fixed-order fp32 conv to bit-match Megatron's batch-invariant path
+            # (gated_delta_net.py: _causal_depthwise_conv1d in fp32, fp32 silu, then cast to bf16).
+            # The fused causal_conv1d_update CUDA kernel accumulates the 4-tap FMA in a different
+            # order and diverges by ~1 bf16 ULP even when all inputs are bit-identical.
             #
-            # Fixed-shape / capture-safe: operate on ALL B rows, indexing conv_states directly by
-            # cache_indices. PAD slots carry cache_indices == -1 (PAD_SLOT_ID). Route them to the
-            # mamba pool's reserved dummy row 0 via clamp(min=0): the pool free list is arange(1,
-            # size+1) so row 0 is NEVER allocated to a live request, while raw -1 would wrap to row
-            # `size` (the last ALLOCATABLE row). When the decode batch fills the pool (batch ==
-            # mamba pool size == max_running_requests) and a request finishes, the pad slot's -1
-            # would alias the live request holding row `size`: the scatter below then has a
-            # duplicate index (that live row written by both its real batch position and the pad
-            # slot) whose order is unspecified and resolves differently under cuda-graph replay vs
-            # Megatron prefill, silently corrupting that trajectory's conv history from the first
-            # padded step to EOS. clamp is a no-op for valid indices (>=1) so real rows stay
-            # bit-identical; pad conv output is garbage but zeroed downstream (GDN zeroes PAD rows
-            # in-kernel). Avoids the boolean-mask gather/scatter (cache_indices[valid]) whose
-            # data-dependent shape forces a GPU->CPU sync illegal under cuda-graph capture.
-            safe_idx = cache_indices.clamp(min=0)
-            state_len = conv_states.shape[-1]
-            prev = conv_states[safe_idx]  # [B, dim, state_len], oldest first
-            window = torch.cat([prev, mixed_qkv.unsqueeze(-1)], dim=-1)  # [B, dim, width]
-            conv_out = _causal_depthwise_conv1d(
-                window.float(),
-                layer.conv_weights.unsqueeze(1).float(),
-                layer.bias.float() if layer.bias is not None else None,
-            )  # [B, dim, width]; last column is the current token's conv output
-            act = conv_out[..., -1]
+            # ONE fused Triton launch does the gather + fp32 causal conv + in-place left-roll of
+            # conv_states, replacing the eager index-gather + cat + 3x float + K-tap conv + slice +
+            # cast + scatter chain (~15 tiny launch-bound kernels/layer -> the bulk of the decode
+            # elementwise band). It returns the fp32 PRE-silu conv output; silu stays in torch
+            # because torch's fused F.silu is ~1 bf16 ULP off any elementwise x*sigmoid(x), and the
+            # bit-identity contract pins the activation to Megatron's F.silu. Conv fp32 MAC + rolled
+            # states verified 0 ULP vs the old eager block. Capture-safe / fixed-shape: all B rows,
+            # indexed directly by cache_indices; PAD slots (-1, PAD_SLOT_ID) map in-kernel to the
+            # mamba pool's reserved dummy row 0 (free list is arange(1, size+1) so row 0 is NEVER
+            # allocated to a live request). Routing PAD to the last physical row (size) would alias
+            # the live request holding row `size` when the batch fills the pool, giving the in-place
+            # roll a duplicate write that diverges under cuda-graph replay vs Megatron prefill and
+            # corrupts that trajectory's conv history to EOS (train_rollout_abs_diff regression).
+            # PAD output is garbage but GDN-zeroed downstream; the pad-row roll is harmless scratch.
+            act = _fused_gdn_conv_update(
+                conv_states, mixed_qkv, layer.conv_weights, layer.bias, cache_indices, PAD_SLOT_ID
+            )  # [B, dim] fp32 pre-silu
             if layer.activation in ("silu", "swish"):
                 act = F.silu(act)
             mixed_qkv = act.to(mixed_qkv.dtype)  # [B, dim]; PAD rows garbage, zeroed by GDN
-            # Roll conv_states left: drop oldest, append the current raw pre-conv column. PAD rows
-            # write reserved row 0 (never a live slot); duplicate pad writes there are harmless.
-            conv_states[safe_idx] = window[:, :, -state_len:].to(conv_states.dtype)
         else:
             mixed_qkv = causal_conv1d_update(
                 mixed_qkv,
