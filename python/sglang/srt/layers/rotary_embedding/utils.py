@@ -47,19 +47,25 @@ def apply_rotary_emb(
         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
             positional embeddings.
     """
-    cos = cos.unsqueeze(-2).to(x.dtype)
-    sin = sin.unsqueeze(-2).to(x.dtype)
+    # FP32 multiply to bit-match Megatron (rope_utils: t.float()*cos_ + _rotate_half(t).float()*sin_).
+    # This is the true-on-policy forward_native path; a bf16 multiply here rounds ~1 ULP off Megatron
+    # on rare query values (e.g. layer-39 pos-5981 rank3), which folds into the GDN recurrent state and
+    # breaks decode/train bit-identity. cos/sin stay fp32 (cache is fp32); cast the result back to x.
+    orig_dtype = x.dtype
+    cos = cos.unsqueeze(-2).float()
+    sin = sin.unsqueeze(-2).float()
     if is_neox_style:
-        x1, x2 = torch.chunk(x, 2, dim=-1)
+        x1, x2 = torch.chunk(x.float(), 2, dim=-1)
     else:
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
+        xf = x.float()
+        x1 = xf[..., ::2]
+        x2 = xf[..., 1::2]
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
     if is_neox_style:
-        return torch.cat((o1, o2), dim=-1)
+        return torch.cat((o1, o2), dim=-1).to(orig_dtype)
     else:
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
+        return torch.stack((o1, o2), dim=-1).flatten(-2).to(orig_dtype)
 
 
 # Copied from transformers
