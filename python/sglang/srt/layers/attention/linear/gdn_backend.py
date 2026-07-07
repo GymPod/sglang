@@ -329,19 +329,50 @@ if _HAVE_TRITON:
         core_out = tl.where(ar == PAD_ROW, 0.0, core_row)
         tl.store(out_ptr + (bt * HV + h) * Dv + dv, core_out)
         tl.store(vnew_ptr + (base + i) * Dv + dv, vnew_row)
-        # In-kernel width advance + boundary fold (was python-side, blocking cuda-graph capture).
-        # On the 64th token fold Snew straight into the boundary S (S already read into registers
-        # above, so overwriting S_ptr here is safe) and restart the partial chunk at width 0; else
-        # advance to width W. inext_ptr is a separate buffer from i_ptr so this store never races the
-        # in-flight reads of i_ptr this launch (python rolls i_buf<-inext_buf between launches). All
-        # HV programs for this arena row write the SAME next width, so the concurrent stores tie.
-        if W == CS:
+        # Width advance only: on the 64th token restart the partial chunk at width 0 (the boundary
+        # fold that produces the fresh S runs in the separate _gdn_fold_kernel below), else advance to
+        # width W. inext_ptr is a separate buffer from i_ptr so this store never races the in-flight
+        # reads of i_ptr this launch (python rolls i_buf<-inext_buf AFTER the fold kernel). All HV
+        # programs for this arena row write the SAME next width, so the concurrent stores tie.
+        # The fold was pulled OUT of this hot kernel: its unrolled 64-iteration [Dk,Dv] outer-product
+        # inflates this kernel's register footprint for EVERY step (spills 798 -> 1106, ~26% slower at
+        # decode batch 4) even though the W==CS branch fires only 1/64 steps. Splitting it makes the
+        # per-token path leaner and pays the fold's cost only on the boundary step. Bit-identical: the
+        # fold kernel reloads the exact fp32 kn/vnew/gcum/S tiles this kernel wrote to global.
+        tl.store(inext_ptr + ar, tl.where(W == CS, 0, W))
+
+    @triton.jit
+    def _gdn_fold_kernel(
+        gcum_ptr, kn_ptr, vnew_ptr, S_ptr, i_ptr, row_ptr,
+        HV: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr, CS: tl.constexpr,
+    ):
+        """Boundary fold, split out of _gdn_step_kernel. On the 64th token (W==CS) folds the completed
+        chunk into the recurrent boundary state S; a no-op on every other step. One program per (slot,
+        value-head), launched right after the step kernel and BEFORE the i_buf<-inext_buf roll (so this
+        reads the pre-roll width W=CS). Reloads kn/vnew/gcum/S from the global buffers the step kernel
+        just wrote, so it is bit-for-bit identical to the old in-kernel fold (verified 0.0 on S/out).
+
+        The fold is a fixed token-order rank-1 accumulation (NOT tl.dot): it must bit-match
+        _chunk_scan_kernel's boundary fold, and a tl.dot tiles the [Dk,Dv] output differently between
+        the two separately compiled kernels and drifts ~1 fp32 ULP under any precision. The unrolled
+        c=0..CS-1 outer-product sum has one accumulation order baked identically into both kernels."""
+        pid = tl.program_id(0)
+        bt = pid // HV
+        h = pid % HV
+        ar = tl.load(row_ptr + bt)
+        i = tl.load(i_ptr + ar)
+        if i + 1 == CS:
+            r = tl.arange(0, CS)
+            dk = tl.arange(0, Dk)
+            dv = tl.arange(0, Dv)
+            base = (ar * HV + h) * CS
+            gcum = tl.load(gcum_ptr + base + r)
+            kn = tl.load(kn_ptr + ((ar * CS + r[:, None]) * HV + h) * Dk + dk[None, :])
+            vnew_full = tl.load(vnew_ptr + (base + r[:, None]) * Dv + dv[None, :])
+            S = tl.load(S_ptr + (ar * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :])
+            bar = tl.sum(tl.where(r == 0, gcum, 0.0), 0) < 1e30  # always true, not provably so
             glast = tl.sum(tl.where(r == (CS - 1), gcum, 0.0), 0)
             kdec = kn * libdevice.exp(glast - gcum)[:, None]
-            # Fixed token-order rank-1 accumulation (NOT tl.dot): must bit-match _chunk_scan_kernel's
-            # boundary fold. A tl.dot tiles the [Dk,Dv] output differently between the two separately
-            # compiled kernels and drifts ~1 fp32 ULP under any precision; the unrolled outer-product
-            # sum has one accumulation order in both. See the scan kernel's fold comment.
             upd = tl.zeros([Dk, Dv], tl.float32)
             for c in range(CS):
                 kc = tl.sum(tl.where(r[:, None] == c, kdec, 0.0), 0)  # [Dk] row c
@@ -350,9 +381,6 @@ if _HAVE_TRITON:
             sc = tl.where(bar, S * libdevice.exp(glast), 0.0)  # round before add (matches scan)
             Snew = sc + tl.where(bar, upd, 0.0)
             tl.store(S_ptr + (ar * HV + h) * Dk * Dv + dk[:, None] * Dv + dv[None, :], Snew)
-            tl.store(inext_ptr + ar, 0)
-        else:
-            tl.store(inext_ptr + ar, W)
 
     @triton.jit
     def _chunk_scan_kernel(
@@ -1276,6 +1304,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             arena["i_buf"], arena["inext_buf"], row_map,
             scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C, PAD_ROW=self.gdn_pad_row,
             SPREC=GDN_SCAN_PREC, num_warps=8,
+        )
+        # Boundary fold, split out of the step kernel above (leaner per-token registers -> ~26% faster
+        # step at decode batch 4). No-op unless this step completes a chunk (i_buf width == C); reads
+        # the SAME pre-roll i_buf the step kernel read, so it must run BEFORE the i_buf<-inext_buf roll.
+        # num_warps=4 (the fold has no wide matmul, so 8 warps only add scheduling overhead).
+        _gdn_fold_kernel[(B * HV,)](
+            arena["gcum"], arena["kn"], arena["vnew"], arena["boundary"],
+            arena["i_buf"], row_map,
+            HV=HV, Dk=Dk, Dv=Dv, CS=C, num_warps=4,
         )
         # Roll width forward for the next step: i_buf <- inext_buf (in-place, capturable). Whole-arena
         # copy is safe: an inactive row already has i_buf == inext_buf (its last active step's roll
