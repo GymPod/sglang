@@ -362,8 +362,9 @@ if _HAVE_TRITON:
 
         The fold is a fixed token-order rank-1 accumulation (NOT tl.dot): it must bit-match
         _chunk_scan_kernel's boundary fold, and a tl.dot tiles the [Dk,Dv] output differently between
-        the two separately compiled kernels and drifts ~1 fp32 ULP under any precision. The unrolled
-        c=0..CS-1 outer-product sum has one accumulation order baked identically into both kernels."""
+        the two separately compiled kernels and drifts ~1 fp32 ULP even at matched num_warps (verified:
+        fails test_incremental_replay boundary Snew). The unrolled c=0..CS-1 outer-product sum has one
+        accumulation order baked identically into both kernels."""
         pid = tl.program_id(0)
         bt = pid // HV
         h = pid % HV
@@ -396,18 +397,26 @@ if _HAVE_TRITON:
         Sinit_ptr, core_ptr, last_ptr, bnd_ptr,        # recurrent state in / out
         nchunks_ptr, bchunk,                           # per-seq real chunk count [N], boundary chunk
         HV: tl.constexpr, NC: tl.constexpr, C: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr,
-        PREC: tl.constexpr,
+        VT: tl.constexpr, VTILES: tl.constexpr, PREC: tl.constexpr,
     ):
         """Fused cross-chunk GDN recurrence: the SERIAL scan over `last_recurrent_state` (the torch
-        loop at torch_chunk_gated_delta_rule lines 563-573 / Megatron 1348-1358) in ONE launch per
-        (sequence, value-head). The full [Dk,Dv] state stays resident in registers across the whole
-        chunk loop, so it never round-trips through HBM (the torch loop pushed the state 32x). The
-        intra-chunk WY work (l2norm, cumsum, T-solve, v_solved=T@v_beta, k_cumdecay=T@(k_beta*exp g))
-        stays on the existing parallel torch path and is streamed in per chunk.
+        loop at torch_chunk_gated_delta_rule lines 563-573 / Megatron 1348-1358). The [Dk,VT] state
+        slice stays resident in registers across the whole chunk loop, so it never round-trips through
+        HBM (the torch loop pushed the state 32x). The intra-chunk WY work (l2norm, cumsum, T-solve,
+        v_solved=T@v_beta, k_cumdecay=T@(k_beta*exp g)) stays on the existing parallel torch path and
+        is streamed in per chunk.
 
-        Under tf32 (see GDN_SCAN_PREC) the dots run on tensor cores, which do NOT spill the full
-        [Dk,Dv] fp32 state, so there is no V-tiling: grid is (N,HV) and each program holds the whole
-        [Dk,Dv] S. (fp32-IEEE FMA units DO spill the full slab ~16x, but tf32 is the shipping path.)
+        V-tiling: the recurrence is COLUMN-SEPARABLE in Dv -- S[:,dv] evolves using only S[:,dv]
+        (fold upd[:,dv]=kdec^T@vnew[:,dv]; vprime[:,dv]=kcd@S[:,dv]; attn_inter[:,dv]=qg@S[:,dv]) -- so
+        each program owns a VT-wide Dv slice of S and the grid is (N,HV,VTILES). This is the lever for
+        the boundary fold, which was 95% of this kernel (a serial C=64 rank-1 [Dk,Dv] outer-product
+        sum off tensor cores): at N=1 grid was only HV=48 programs on 148 SMs, so the fold ran at ~1/3
+        occupancy. VTILES>1 multiplies program count (VTILES=2 -> 96 programs, ~2x faster fold) at the
+        cost of recomputing the Dv-independent attn2=q@k^T and decay per tile (cheap). Bit-identical:
+        the fold is a per-element sum_c independent of the dv range, and the tf32 SPREC dots are
+        N-tile-invariant (V is the MMA N dim, not the K reduction dim) -- VERIFIED 0.0 by decode==
+        prefill (the decode _gdn_step_kernel runs FULL Dv in one program, so test_gdn_chunk_replay_
+        decode's torch.equal is the exact N-invariance check).
 
         Cross-engine identity is by construction: sglang prefill, Megatron's forward, and the decode
         chunk-replay all run THIS kernel at this same PREC, so the dots need not match aten's fp32 bmm.
@@ -418,20 +427,21 @@ if _HAVE_TRITON:
         are exact recurrent no-ops (g=0 -> decay 1, k=v=0 -> zero update).
         """
         pid = tl.program_id(0)
-        h = pid % HV
-        n = pid // HV
+        vt = pid % VTILES
+        h = (pid // VTILES) % HV
+        n = pid // (VTILES * HV)
         nchunks = tl.load(nchunks_ptr + n)
         r = tl.arange(0, C)
         dk = tl.arange(0, Dk)
-        dv = tl.arange(0, Dv)
+        dv = vt * VT + tl.arange(0, VT)  # this program's Dv slice
         lower = r[:, None] >= r[None, :]  # keep lower incl diag (matches tril + masked_fill(triu(1)))
         s_off = (n * HV + h) * Dk * Dv
-        S = tl.load(Sinit_ptr + s_off + dk[:, None] * Dv + dv[None, :])  # [Dk,Dv] resident in regs
+        S = tl.load(Sinit_ptr + s_off + dk[:, None] * Dv + dv[None, :])  # [Dk,VT] resident in regs
         for i in range(0, nchunks):
             cbase = ((n * HV + h) * NC + i) * C
             q = tl.load(q_ptr + cbase * Dk + r[:, None] * Dk + dk[None, :])  # [C,Dk] scaled+l2normed
             k = tl.load(k_ptr + cbase * Dk + r[:, None] * Dk + dk[None, :])  # [C,Dk] l2normed
-            vs = tl.load(vsolved_ptr + cbase * Dv + r[:, None] * Dv + dv[None, :])  # [C,Dv] T@v_beta
+            vs = tl.load(vsolved_ptr + cbase * Dv + r[:, None] * Dv + dv[None, :])  # [C,VT] T@v_beta
             kcd = tl.load(kcd_ptr + cbase * Dk + r[:, None] * Dk + dk[None, :])  # [C,Dk] T@(kb*exp g)
             gc = tl.load(gcum_ptr + cbase + r)  # [C] rounded-fp32 cumulative decay
             # Each matmul result feeding an add/sub is rounded to a register FIRST (via the `bar`
@@ -457,18 +467,17 @@ if _HAVE_TRITON:
             glast = tl.sum(tl.where(r == C - 1, gc, 0.0), 0)  # gcum[C-1], single-lane collapse
             kdec = k * libdevice.exp(glast - gc)[:, None]  # [C,Dk]
             # The boundary fold contracts all C rows into the recurrent state. A tl.dot here drifts
-            # ~1 fp32 ULP between the two separately-compiled scan/step kernels (the [Dk,Dv] output
-            # is MMA-tiled differently under their different register pressure -- true under ieee AND
-            # tf32) which slowly desyncs the decode-replay state from prefill across multi-chunk
-            # decode and compounds over layers. Fold instead as a fixed token-order rank-1
-            # accumulation: a c=0..C-1 unrolled sum of outer products has one accumulation order
-            # baked identically into both kernels (the row-select tl.sum is single-lane, so
-            # num_warps- and tile-invariant), so decode==prefill EXACTLY. One fold per chunk, off the
-            # per-token hot path.
-            upd = tl.zeros([Dk, Dv], tl.float32)
+            # ~1 fp32 ULP between the scan and the decode _gdn_fold_kernel: Triton MMA-tiles the
+            # [Dk,Dv] output differently between the two separately-compiled kernels (different grid
+            # shape / surrounding register pressure) even at matched num_warps -- verified: the tl.dot
+            # fold fails test_incremental_replay boundary Snew even nw8-matched. Fold instead as a
+            # fixed token-order rank-1 accumulation: a c=0..C-1 unrolled sum of outer products has one
+            # accumulation order baked identically into both kernels (the row-select tl.sum is
+            # single-lane, so num_warps- and tile-invariant), so decode==prefill EXACTLY.
+            upd = tl.zeros([Dk, VT], tl.float32)
             for c in range(C):
                 kc = tl.sum(tl.where(r[:, None] == c, kdec, 0.0), 0)  # [Dk] row c
-                vc = tl.sum(tl.where(r[:, None] == c, vnew, 0.0), 0)  # [Dv] row c
+                vc = tl.sum(tl.where(r[:, None] == c, vnew, 0.0), 0)  # [VT] row c
                 upd += kc[:, None] * vc[None, :]
             sc = tl.where(bar, S * libdevice.exp(glast), 0.0)  # round before add (else FMA drift)
             S = sc + tl.where(bar, upd, 0.0)
@@ -499,12 +508,20 @@ def _fused_chunk_scan(query, key, gcum, v_solved, k_cumdecay, s_init, nchunks, b
     core = torch.zeros(N, HV, NC, C, Dv, device=query.device, dtype=torch.float32)
     last = torch.empty(N, HV, Dk, Dv, device=query.device, dtype=torch.float32)
     bnd = torch.empty(1, HV, Dk, Dv, device=query.device, dtype=torch.float32) if want_boundary else last
-    # tf32 tensor cores hold the full [Dk,Dv] state resident (no V-tiling): grid is (N,HV).
-    _chunk_scan_kernel[(N * HV,)](
+    # V-tile the recurrence for occupancy: the serial rank-1 boundary fold (95% of this kernel) is
+    # occupancy-starved at grid=(N*HV) (only 48 programs at N=1 on 148 SMs). The recurrence is
+    # column-separable in Dv, so split S into VTILES Dv-slices -> grid (N*HV*VTILES). At N=1, VTILES=2
+    # (VT=64) roughly halves scan time (fold 8.24 -> 4.27 ms/launch); bit-identical (fold is a per-Dv-
+    # element sum, dots are N-tile-invariant). Verified 0.0 by decode==prefill (decode runs full Dv).
+    # Only tile while the base grid under-fills the SMs (~148 on B200): once N*HV saturates, extra
+    # tiles just redundantly recompute the Dv-independent attn2=q@k^T (a slight regression at N>=8).
+    SM_TARGET = 148
+    VTILES = 2 if N * HV < SM_TARGET and Dv % 2 == 0 else 1
+    _chunk_scan_kernel[(N * HV * VTILES,)](
         query, key, gcum, v_solved, k_cumdecay,
         s_init, core, last, bnd,
         nchunks, bchunk if want_boundary else -1,
-        HV=HV, NC=NC, C=C, Dk=Dk, Dv=Dv, PREC=GDN_SCAN_PREC,
+        HV=HV, NC=NC, C=C, Dk=Dk, Dv=Dv, VT=Dv // VTILES, VTILES=VTILES, PREC=GDN_SCAN_PREC,
         num_warps=8, num_stages=1,
     )
     return core, last, (bnd if want_boundary else None)
