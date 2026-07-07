@@ -236,7 +236,8 @@ if _HAVE_TRITON:
         q_ptr, k_ptr, v_ptr, a_ptr, b_ptr, Alog_ptr, dtb_ptr,  # new token: q/k [B,HK,Dk], v [B,HV,Dv], a/b [B,HV]
         qn_ptr, kn_ptr, kb_ptr, vb_ptr, g_ptr, gcum_ptr, A_ptr, T_ptr,
         vnew_ptr, S_ptr, out_ptr, i_ptr, inext_ptr, row_ptr,
-        scale, HV: tl.constexpr, HK: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr,
+        scale, QRS: tl.constexpr, KRS: tl.constexpr, VRS: tl.constexpr,  # q/k/v per-batch-row strides
+        HV: tl.constexpr, HK: tl.constexpr, Dk: tl.constexpr, Dv: tl.constexpr,
         CS: tl.constexpr, PAD_ROW: tl.constexpr, SPREC: tl.constexpr,
     ):
         """Whole GDN decode step for the new token in ONE launch (was 5 kernels): prep + gcum append
@@ -280,8 +281,8 @@ if _HAVE_TRITON:
         base = (ar * HV + h) * CS
         row_i = r[:, None] == i  # [CS,1] mask selecting row i
         # --- prep row i (shared l2norm reduction, GQA repeat, scale, gating) ---
-        q = tl.load(q_ptr + (bt * HK + hk) * Dk + dk).to(tl.float32)
-        k = tl.load(k_ptr + (bt * HK + hk) * Dk + dk).to(tl.float32)
+        q = tl.load(q_ptr + bt * QRS + hk * Dk + dk).to(tl.float32)
+        k = tl.load(k_ptr + bt * KRS + hk * Dk + dk).to(tl.float32)
         qn_i = (q * libdevice.rsqrt(tl.sum(q * q, 0) + 1e-6)).to(tl.bfloat16).to(tl.float32) * scale  # [Dk]
         kn_i = (k * libdevice.rsqrt(tl.sum(k * k, 0) + 1e-6)).to(tl.bfloat16).to(tl.float32)  # [Dk]
         av = tl.load(a_ptr + bt * HV + h).to(tl.float32)
@@ -290,7 +291,7 @@ if _HAVE_TRITON:
         sp = tl.where(x > 20.0, x, libdevice.log1p(libdevice.exp(x)))
         g = -libdevice.exp(tl.load(Alog_ptr + h)) * sp
         beta = (1.0 / (1.0 + libdevice.exp(-bx))).to(tl.bfloat16).to(tl.float32)
-        v = tl.load(v_ptr + (bt * HV + h) * Dv + dv).to(tl.float32)
+        v = tl.load(v_ptr + bt * VRS + h * Dv + dv).to(tl.float32)
         kb_i = kn_i * beta  # [Dk]
         vb_i = v * beta  # [Dv]
         tl.store(qn_ptr + ((ar * CS + i) * HV + h) * Dk + dk, qn_i)
@@ -1390,9 +1391,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def _gdn_launch_step(self, arena, layer, q_tok, k_tok, v_tok, a_tok, b_tok, row_map, B, out):
         """Advance `B` slots by one token in ONE launch over a (B*HV,) grid, indexing the arena via
         row_map (batch->arena row). Bit-for-bit reproduces row w-1 of torch_chunk_gated_delta_rule
-        per slot (only indexing differs from the old per-slot launch). q/k_tok [B,HK,Dk], v_tok
-        [B,HV,Dv], a/b_tok [B,HV]. Writes bf16 core rows to out[:B] (batch-indexed), PAD rows
-        zeroed in-kernel."""
+        per slot (only indexing differs from the old per-slot launch). q/k_tok address [B,HK,Dk] and
+        v_tok [B,HV,Dv]; their per-batch-row element strides are read via .stride(0), so they may be
+        strided VIEWS into a packed mixed_qkv (row stride = q_dim+k_dim+v_dim) -- the layer hot path
+        then skips the 3 contiguous() split copies (addressing only, byte-identical loads). Writes
+        bf16 core rows to out[:B] (batch-indexed), PAD rows zeroed in-kernel."""
         C = FLA_CHUNK_SIZE
         HV, HK = layer.num_v_heads, layer.num_k_heads
         Dk, Dv = layer.head_k_dim, layer.head_v_dim
@@ -1402,8 +1405,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             arena["qn"], arena["kn"], arena["kb"], arena["vb"], arena["g"], arena["gcum"],
             arena["A_row"], arena["T"], arena["vnew"], arena["boundary"], out,
             arena["i_buf"], arena["inext_buf"], row_map,
-            scale, HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C, PAD_ROW=self.gdn_pad_row,
-            SPREC=GDN_SCAN_PREC, num_warps=8,
+            scale, QRS=q_tok.stride(0), KRS=k_tok.stride(0), VRS=v_tok.stride(0),
+            HV=HV, HK=HK, Dk=Dk, Dv=Dv, CS=C,
+            PAD_ROW=self.gdn_pad_row, SPREC=GDN_SCAN_PREC, num_warps=8,
         )
         # Boundary fold, split out of the step kernel above (leaner per-token registers -> ~26% faster
         # step at decode batch 4). No-op unless this step completes a chunk (i_buf width == C); reads
@@ -1442,12 +1446,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         a, b: [B, HV] pre-gating inputs. Returns [1, B, HV, head_v_dim].
         """
         B = mixed_qkv.shape[0]
-        q_flat, k_flat, v_flat = torch.split(
-            mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
-        )
-        q_tok = q_flat.view(B, layer.num_k_heads, layer.head_k_dim).contiguous()
-        k_tok = k_flat.view(B, layer.num_k_heads, layer.head_k_dim).contiguous()
-        v_tok = v_flat.view(B, layer.num_v_heads, layer.head_v_dim).contiguous()
+        # Pass q/k/v as strided [B, dim] column-slice VIEWS of the packed mixed_qkv (no split/copy):
+        # each has stride(0) = mixed_qkv row width, and the step kernel indexes hk*Dk+dk within the
+        # block, so this is byte-identical to the old contiguous split but drops the 3 per-layer
+        # contiguous() copies. mixed_qkv is contiguous [B, q_dim+k_dim+v_dim] (fused conv output).
+        qd, kd = layer.q_dim, layer.k_dim
+        q_tok = mixed_qkv[:, :qd]
+        k_tok = mixed_qkv[:, qd:qd + kd]
+        v_tok = mixed_qkv[:, qd + kd:]
         a = a.contiguous()
         b = b.contiguous()
         arena = self._gdn_arena_for(layer)
