@@ -115,11 +115,16 @@ class RotaryEmbedding(MultiPlatformOp):
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
-        # NOTE(woosuk): To exactly match the HF implementation, we need to
-        # use CPU to compute the cache and then move it to GPU. However, we
-        # create the cache on GPU for faster initialization. This may cause
-        # a slight numerical difference between the HF implementation and ours.
-        init_device = "cpu" if is_true_on_policy_enabled() else None
+        # NOTE(woosuk): HF builds this on CPU then moves to GPU. For true-on-policy we must
+        # instead match Megatron, which builds inv_freq directly on CUDA
+        # (rotary_pos_embedding.py: device=torch.cuda.current_device()). The CPU pow differs
+        # from the CUDA pow by 1 fp32 ULP at channel 28 (5.68e-14); on the fixed len-6k
+        # baseline that tips a single rank-3 query element across a bf16 rounding midpoint at
+        # layer 39 pos 5981 (dense_query_post_rope 9.77e-4) and breaks decode/train bit-identity.
+        # Building on CUDA makes inv_freq bit-identical to Megatron (verified 0.0 all channels).
+        init_device = (
+            torch.cuda.current_device() if is_true_on_policy_enabled() else None
+        )
         inv_freq = 1.0 / (
             base
             ** (
@@ -129,8 +134,6 @@ class RotaryEmbedding(MultiPlatformOp):
                 / self.rotary_dim
             )
         )
-        if is_true_on_policy_enabled():
-            inv_freq = inv_freq.cuda()
         return inv_freq
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
