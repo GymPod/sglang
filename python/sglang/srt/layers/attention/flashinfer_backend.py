@@ -1614,78 +1614,79 @@ class FlashInferIndicesUpdaterPrefill:
                         # was evicted (bounded-capacity LRU), a partial hit would leave
                         # recompute_info populated for some layers but not the anchor
                         # (max_recompute_layer_id), so the model's reuse forward would
-                        # KeyError reading compute_mask[anchor]. Decide once, up front.
-                        image_hit = all(
-                            (f"{cur_hash}_{lid}_tp{self.tp_rank}_k" in self.mock_kv_manager)
-                            and (f"{cur_hash}_{lid}_tp{self.tp_rank}_v" in self.mock_kv_manager)
-                            for lid in layer_ids
+                        # KeyError reading compute_mask[anchor]. Decide once, up front,
+                        # under ONE lock (contains_all) instead of 2*num_layers lock
+                        # round-trips per image.
+                        image_hit = self.mock_kv_manager.contains_all(
+                            [
+                                f"{cur_hash}_{lid}_tp{self.tp_rank}_{kv}"
+                                for lid in layer_ids
+                                for kv in ("k", "v")
+                            ]
                         )
                         _n_hit += int(image_hit)
                         _n_miss += int(not image_hit)
 
-                        reuse_happened = False
-                        for layer_id in layer_ids:
-                            ratio = self.recompute_ratio_in_layer[layer_id]
-                            total_num = end_idx - start_idx + 1
-                            recompute_num = max(1, int(total_num * ratio))
-                            reuse_start = start_idx + recompute_num
-                            reuse_end = end_idx + 1
+                        # Reuse geometry is identical for every layer under the
+                        # uniform recompute ratio -- compute it ONCE per image,
+                        # not per layer.
+                        ratio = self.recompute_ratio_in_layer[0]
+                        total_num = end_idx - start_idx + 1
+                        recompute_num = max(1, int(total_num * ratio))
+                        reuse_start = start_idx + recompute_num
+                        reuse_end = end_idx + 1
 
-                            uid_k = f"{cur_hash}_{layer_id}_tp{self.tp_rank}_k"
-                            uid_v = f"{cur_hash}_{layer_id}_tp{self.tp_rank}_v"
-                            is_hit = image_hit
-
-                            if is_hit:
-                                reuse_happened = True
-                                any_reuse = True
-                                # Allocate this layer's staging buffers on first hit only.
+                        if image_hit:
+                            any_reuse = True
+                            abs_start = start_loc + reuse_start
+                            abs_end = start_loc + reuse_end
+                            # Stage this image's reused KV for ALL layers with one
+                            # batched, single-lock copy call (was 2*num_layers
+                            # individually locked get_kv calls).
+                            copy_pairs = []
+                            for layer_id in layer_ids:
                                 _ensure_staging(layer_id)
-                                # Load reused KV into this request's slice (absolute batch pos).
-                                part_k = retrieved_k_list[layer_id][start_loc + reuse_start : start_loc + reuse_end]
-                                part_v = retrieved_v_list[layer_id][start_loc + reuse_start : start_loc + reuse_end]
-                                # get_kv issues a stream-ordered H2D copy into part_k/part_v;
-                                # no device sync is needed here (the copy is ordered against
-                                # the later attention reads on the same stream). The previous
-                                # per-layer torch.cuda.synchronize() flushed the whole GPU
-                                # pipeline ~num_layers times per request -- the dominant TTFT
-                                # overhead -- for no correctness benefit.
-                                self.mock_kv_manager.get_kv(part_k, uid_k, non_blocking=False)
-                                self.mock_kv_manager.get_kv(part_v, uid_v, non_blocking=False)
-
-                                # Preceding compute block (text + this image's recompute head).
+                                copy_pairs.append((
+                                    retrieved_k_list[layer_id][abs_start:abs_end],
+                                    f"{cur_hash}_{layer_id}_tp{self.tp_rank}_k",
+                                ))
+                                copy_pairs.append((
+                                    retrieved_v_list[layer_id][abs_start:abs_end],
+                                    f"{cur_hash}_{layer_id}_tp{self.tp_rank}_v",
+                                ))
+                                # Preceding compute block (text + recompute head).
                                 block_compute_list[layer_id].extend([1, 0])
                                 compute_num_list[layer_id].extend(
                                     [reuse_start - last_idx, reuse_end - reuse_start]
                                 )
-                                if layer_id == layer_ids[0]:
-                                    req_computed += reuse_start - last_idx
-
-                                # Mark reused tokens as "don't compute" in the batch mask.
-                                compute_mask_list[layer_id][start_loc + reuse_start : start_loc + reuse_end] = False
+                                # Mark reused tokens as "don't compute".
+                                compute_mask_list[layer_id][abs_start:abs_end] = False
                                 recompute_info.setdefault(
-                                    layer_id, [retrieved_k_list[layer_id], retrieved_v_list[layer_id]]
+                                    layer_id,
+                                    [retrieved_k_list[layer_id], retrieved_v_list[layer_id]],
                                 )
                                 compute_mask.setdefault(layer_id, compute_mask_list[layer_id])
-                            else:
-                                # Cache miss: this image is computed fresh and must be stored.
-                                # Store ONLY the reuse portion (tokens reuse_start..end),
-                                # NOT the recompute head -- a later hit reuses exactly that
-                                # tail (see the is_hit branch, which reads reuse_start..reuse_end).
-                                # Storing the full image would mismatch the read slice.
-                                # Offsets are into the batch-global COMPRESSED tensor: absolute
-                                # position minus all dropped rows before this image.
-                                abs_reuse_start = start_loc + reuse_start
-                                abs_reuse_end = start_loc + end_idx  # inclusive end of image
-                                real_start = abs_reuse_start - batch_dropped
-                                real_end = abs_reuse_end - batch_dropped
-                                write_info.setdefault(layer_id, []).append(
-                                    [real_start, real_end, uid_k, uid_v]
-                                )
-
-                        if reuse_happened:
+                            self.mock_kv_manager.get_kv_many(copy_pairs)
+                            req_computed += reuse_start - last_idx
                             last_idx = reuse_end
                             # R1 FIX: accumulate dropped rows across the whole batch.
                             batch_dropped += reuse_end - reuse_start
+                        else:
+                            # Cache miss: this image is computed fresh and must be stored.
+                            # Store ONLY the reuse portion (tokens reuse_start..end),
+                            # NOT the recompute head -- a later hit reuses exactly that
+                            # tail (the hit branch reads reuse_start..reuse_end).
+                            # Offsets are into the batch-global COMPRESSED tensor:
+                            # absolute position minus all dropped rows before this image.
+                            real_start = start_loc + reuse_start - batch_dropped
+                            real_end = start_loc + end_idx - batch_dropped  # inclusive
+                            for layer_id in layer_ids:
+                                write_info.setdefault(layer_id, []).append([
+                                    real_start,
+                                    real_end,
+                                    f"{cur_hash}_{layer_id}_tp{self.tp_rank}_k",
+                                    f"{cur_hash}_{layer_id}_tp{self.tp_rank}_v",
+                                ])
 
             # Trailing compute block for the rest of this request.
             for layer_id in layer_ids:

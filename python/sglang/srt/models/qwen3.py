@@ -435,7 +435,30 @@ class Qwen3Attention(nn.Module):
             self.is_max_recompute_layer
         ), "VLCache non-uniform per-layer recompute ratio is not supported yet"
 
-        compute_mask = forward_batch.compute_mask[self.max_recompute_layer_id]
+        # Per-prefill reuse context: masks/indices/positions are IDENTICAL across
+        # all layers (uniform ratio), so build them once at the first reuse layer
+        # and share. This removes 64x repeated boolean indexing and — critically —
+        # the per-layer int(mask.sum()) assert, which forced a GPU->CPU sync on
+        # every compressed layer (the dominant hit-path overhead).
+        ctx = forward_batch.vlcache_reuse_ctx
+        if ctx is None:
+            compute_mask = forward_batch.compute_mask[self.max_recompute_layer_id]
+            compute_idx = compute_mask.nonzero(as_tuple=True)[0]
+            reuse_idx = (~compute_mask).nonzero(as_tuple=True)[0]
+            ctx = {
+                "compute_mask": compute_mask,
+                "compute_idx": compute_idx,
+                "reuse_idx": reuse_idx,
+                # positions is [3, total_tokens] (mRoPE); pre-slice both column sets.
+                "pos_compute": positions[..., compute_idx].contiguous(),
+                "pos_reuse": positions[..., reuse_idx].contiguous(),
+                "num_compute": compute_idx.numel(),
+            }
+            forward_batch.vlcache_reuse_ctx = ctx
+        compute_mask = ctx["compute_mask"]
+        compute_idx = ctx["compute_idx"]
+        reuse_idx = ctx["reuse_idx"]
+
         k, v = forward_batch.recompute_info[self.layer_id]
 
         # 1. Project + QK-norm ONLY the recompute tokens.
@@ -445,11 +468,12 @@ class Qwen3Attention(nn.Module):
         #    compressed tensor. compute_mask stays full batch length (it also masks the
         #    full-length reused K/V below), so only index hidden when it's still full.
         if hidden_states.shape[0] == compute_mask.shape[0]:
-            compute_hidden = hidden_states[compute_mask]
+            compute_hidden = hidden_states.index_select(0, compute_idx)
         else:
-            assert hidden_states.shape[0] == int(compute_mask.sum()), (
+            # Shape check against the cached python int — no device sync.
+            assert hidden_states.shape[0] == ctx["num_compute"], (
                 f"VLCache: pre-compressed hidden rows {hidden_states.shape[0]} != "
-                f"recompute rows {int(compute_mask.sum())} (layer {self.layer_id})"
+                f"recompute rows {ctx['num_compute']} (layer {self.layer_id})"
             )
             compute_hidden = hidden_states
         qkv, _ = self.qkv_proj(compute_hidden)
@@ -465,30 +489,30 @@ class Qwen3Attention(nn.Module):
             q=q, k=k_part, q_norm=self.q_norm, k_norm=self.k_norm,
             head_dim=self.head_dim, alt_stream=self.alt_stream, allow_inplace=True,
         )
-        q, k_part = self.rotary_emb(positions[..., compute_mask], q.contiguous(), k_part.contiguous())
+        q, k_part = self.rotary_emb(ctx["pos_compute"], q.contiguous(), k_part.contiguous())
 
-        # 4. The reused K were stored pre-RoPE; QK-norm + RoPE them at CURRENT positions
-        #    (a dummy q satisfies the rotary_emb signature; only k is used).
-        #    Only the REUSED rows (~compute_mask) need this: the recompute rows of k are
-        #    overwritten by k_part in step 5, so RoPE-ing the full batch here wasted work
-        #    on every row that gets discarded. RoPE is per-position independent, so
-        #    processing just the reused subset is exactly equivalent. positions is
-        #    [3, total_tokens] (mRoPE); slicing the reuse columns keeps them aligned.
-        reuse_sel = ~compute_mask
-        k_reuse = k[reuse_sel]
-        dummy_q = torch.empty_like(k_reuse)
-        dummy_q, k_reuse = apply_qk_norm(
-            q=dummy_q, k=k_reuse, q_norm=self.q_norm, k_norm=self.k_norm,
-            head_dim=self.head_dim, alt_stream=self.alt_stream,
-        )
-        _, k_reuse = self.rotary_emb(
-            positions[..., reuse_sel], dummy_q, k_reuse.contiguous()
-        )
+        # 4. The reused K were stored pre-RoPE; K-norm + RoPE them at CURRENT positions.
+        #    Only the REUSED rows need this (recompute rows of k are overwritten by
+        #    k_part in step 5). Norm k directly — the old dummy-q apply_qk_norm spent
+        #    a fused-kernel pass normalizing a garbage q tensor every layer. RoPE
+        #    still needs a q argument; give it an empty-rows view so the kernel does
+        #    no q work. index_select returns a fresh contiguous tensor, so in-place
+        #    norm never touches the staging buffer's reused rows.
+        k_reuse = k.index_select(0, reuse_idx)
+        k_reuse = self.k_norm(k_reuse.view(-1, self.head_dim)).view(k_reuse.shape)
+        # RoPE needs a q argument; reuse ONE cached dummy across all 64 layers
+        # (same shape every layer) instead of an empty_like alloc per layer.
+        dummy_q = ctx.get("dummy_q")
+        if dummy_q is None or dummy_q.shape != k_reuse.shape:
+            dummy_q = torch.empty_like(k_reuse)
+            ctx["dummy_q"] = dummy_q
+        _, k_reuse = self.rotary_emb(ctx["pos_reuse"], dummy_q, k_reuse)
 
-        # 5. Assemble the full per-layer K/V: re-RoPE'd reused rows + fresh recompute rows.
-        k[reuse_sel, :] = k_reuse
-        k[compute_mask, :] = k_part
-        v[compute_mask, :] = v_part
+        # 5. Assemble the full per-layer K/V: re-RoPE'd reused rows + fresh recompute
+        #    rows. index_copy_ with int indices (cheaper than boolean-mask scatter).
+        k.index_copy_(0, reuse_idx, k_reuse)
+        k.index_copy_(0, compute_idx, k_part.to(k.dtype))
+        v.index_copy_(0, compute_idx, v_part.to(v.dtype))
 
         # 6. Attention: q holds only recompute tokens; k/v hold the full image KV.
         attn_output = self.attn(q, k, v, forward_batch)

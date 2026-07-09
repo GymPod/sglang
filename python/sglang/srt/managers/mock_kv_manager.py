@@ -31,7 +31,7 @@ import collections
 import logging
 import os
 import threading
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -120,6 +120,18 @@ class MockKVManager:
         with self.lock:
             return uid in self.uid_to_handle
 
+    def contains_all(self, uids: List[str]) -> bool:
+        """Membership test for many uids under ONE lock acquisition.
+
+        The per-image all-or-nothing hit check probes 2*num_layers uids; doing
+        that via ``uid in manager`` costs 2*num_layers lock round-trips per
+        image per prefill. One lock + set lookup makes the check O(uids) cheap
+        and atomic against concurrent eviction between probes.
+        """
+        with self.lock:
+            handles = self.uid_to_handle
+            return all(uid in handles for uid in uids)
+
     def write_kv(
         self, tensor: torch.Tensor, uid: str, non_blocking: bool = False
     ) -> Union[str, Tuple[str, MockFlag]]:
@@ -188,6 +200,34 @@ class MockKVManager:
             flag.set()
             return flag
         return None
+
+    def get_kv_many(self, pairs: List[Tuple[torch.Tensor, str]]) -> None:
+        """Copy many stored tensors into their targets under ONE lock acquisition.
+
+        ``pairs`` is [(target_tensor, uid), ...]. Fetches all sources + LRU-touches
+        under the lock, then issues the (stream-ordered) copies lock-free. One
+        lock instead of 2*num_layers per hit image. Raises ``KeyError`` on any
+        missing uid and ``ValueError`` on shape mismatch, before any copy is
+        issued -- all-or-nothing, same fail-loudly contract as ``get_kv``.
+        """
+        with self.lock:
+            resolved = []
+            for target_tensor, uid in pairs:
+                handle = self.uid_to_handle.get(uid)
+                if handle is None:
+                    raise KeyError(f"uid {uid} not found in MockKVManager")
+                self.uid_to_handle.move_to_end(uid)  # LRU touch
+                expected_shape = (handle.get_num_blocks(),) + tuple(
+                    target_tensor.shape[1:]
+                )
+                if tuple(target_tensor.shape) != expected_shape:
+                    raise ValueError(
+                        f"get_kv_many target shape {tuple(target_tensor.shape)} != "
+                        f"stored shape {expected_shape} for uid {uid}"
+                    )
+                resolved.append((target_tensor, self.uid_to_tensor[uid]))
+        for target_tensor, source_tensor in resolved:
+            target_tensor.copy_(source_tensor)
 
     def release(self, uid: str) -> None:
         """Drop a single entry if present."""

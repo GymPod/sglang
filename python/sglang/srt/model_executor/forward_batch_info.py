@@ -457,6 +457,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # request's cached_tokens accounting (-> meta_info) by the scheduler's
     # prefill output processing, alongside radix-prefix hits.
     vlcache_reused_tokens_per_req: Optional[List[int]] = None
+    # Per-prefill reuse-forward context, built lazily by the FIRST reuse layer
+    # and shared by all later layers (the mask is identical across layers under
+    # a uniform recompute ratio). Holds index tensors and pre-sliced positions
+    # so per-layer boolean indexing / device syncs are not repeated 64x.
+    # Keys: compute_mask, compute_idx, reuse_idx, pos_compute, pos_reuse,
+    #       num_compute (python int). See Qwen3Attention._forward_vlcache_reuse.
+    vlcache_reuse_ctx: Optional[Dict[str, object]] = None
 
     @classmethod
     def init_new(
