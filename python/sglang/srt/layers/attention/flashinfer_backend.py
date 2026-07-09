@@ -1528,11 +1528,13 @@ class FlashInferIndicesUpdaterPrefill:
         device = forward_batch.input_ids.device
         total_tokens = forward_batch.input_ids.shape[0]
 
-        # Per-layer plan accumulators (concatenated across requests in batch order).
-        block_compute_list = [[] for _ in layer_ids]  # 1=compute block, 0=reuse block
-        compute_num_list = [[] for _ in layer_ids]  # token count of each block
-        valid_cumsum = [[] for _ in layer_ids]  # per-request cumulative #compute-blocks
-        total_cumsum = [[] for _ in layer_ids]  # per-request cumulative #blocks
+        # Plan accumulators (concatenated across requests in batch order). The plan
+        # is IDENTICAL for every layer under the uniform recompute ratio, so build
+        # it once (per-layer copies were 64x redundant list work per prefill).
+        block_compute: List[int] = []  # 1=compute block, 0=reuse block
+        compute_num: List[int] = []  # token count of each block
+        valid_cumsum: List[int] = []  # per-request cumulative #compute-blocks
+        total_cumsum: List[int] = []  # per-request cumulative #blocks
         actual_extend_seq_len: List[int] = []
 
         compute_mask: dict = {}
@@ -1542,26 +1544,28 @@ class FlashInferIndicesUpdaterPrefill:
         if not forward_batch.forward_mode.is_extend():
             return False
 
-        # Per-layer batch-wide compute mask (True=recompute). Cheap (1 byte/token).
-        compute_mask_list = [
-            torch.ones(total_tokens, dtype=torch.bool, device=device) for _ in layer_ids
-        ]
-        # Per-layer reused-KV staging buffers, allocated LAZILY: only a layer that
-        # actually gets a cache hit needs one. Eagerly allocating num_layers*2
-        # full-batch tensors every prefill (even with zero reuse) zeroed ~hundreds of
-        # MB per forward for nothing. `empty` (not `zeros`) is safe: every row is
-        # either filled by get_kv (reuse rows) or overwritten by the recompute splice
-        # before attention reads it, so uninitialized rows are never observed.
-        retrieved_k_list: List[Optional[torch.Tensor]] = [None] * len(layer_ids)
-        retrieved_v_list: List[Optional[torch.Tensor]] = [None] * len(layer_ids)
+        # ONE batch-wide compute mask (True=recompute), shared by every layer's
+        # dict entry -- the mask is layer-invariant under a uniform ratio. (Was
+        # num_layers separate tensors + num_layers slice-writes per hit image.)
+        shared_mask: Optional[torch.Tensor] = None
+        # Reused-KV staging: ONE 3D tensor per k/v ([num_layers, total, kv]) with
+        # per-layer views, allocated lazily on the first hit. `empty` (not `zeros`)
+        # is safe: every row is either filled by get_kv_many (reuse rows) or
+        # overwritten by the recompute splice before attention reads it.
+        retrieved_k3: Optional[torch.Tensor] = None
+        retrieved_v3: Optional[torch.Tensor] = None
 
-        def _ensure_staging(layer_id: int) -> None:
-            if retrieved_k_list[layer_id] is None:
-                retrieved_k_list[layer_id] = torch.empty(
-                    (total_tokens, self.kv_size), dtype=self.data_type, device=device
+        def _ensure_staging() -> None:
+            nonlocal retrieved_k3, retrieved_v3, shared_mask
+            if retrieved_k3 is None:
+                retrieved_k3 = torch.empty(
+                    (len(layer_ids), total_tokens, self.kv_size),
+                    dtype=self.data_type,
+                    device=device,
                 )
-                retrieved_v_list[layer_id] = torch.empty(
-                    (total_tokens, self.kv_size), dtype=self.data_type, device=device
+                retrieved_v3 = torch.empty_like(retrieved_k3)
+                shared_mask = torch.ones(
+                    total_tokens, dtype=torch.bool, device=device
                 )
 
         # R1 FIX: batch-cumulative count of dropped (reused) rows, spanning ALL
@@ -1640,33 +1644,27 @@ class FlashInferIndicesUpdaterPrefill:
                             any_reuse = True
                             abs_start = start_loc + reuse_start
                             abs_end = start_loc + reuse_end
+                            _ensure_staging()
                             # Stage this image's reused KV for ALL layers with one
                             # batched, single-lock copy call (was 2*num_layers
                             # individually locked get_kv calls).
                             copy_pairs = []
                             for layer_id in layer_ids:
-                                _ensure_staging(layer_id)
                                 copy_pairs.append((
-                                    retrieved_k_list[layer_id][abs_start:abs_end],
+                                    retrieved_k3[layer_id, abs_start:abs_end],
                                     f"{cur_hash}_{layer_id}_tp{self.tp_rank}_k",
                                 ))
                                 copy_pairs.append((
-                                    retrieved_v_list[layer_id][abs_start:abs_end],
+                                    retrieved_v3[layer_id, abs_start:abs_end],
                                     f"{cur_hash}_{layer_id}_tp{self.tp_rank}_v",
                                 ))
-                                # Preceding compute block (text + recompute head).
-                                block_compute_list[layer_id].extend([1, 0])
-                                compute_num_list[layer_id].extend(
-                                    [reuse_start - last_idx, reuse_end - reuse_start]
-                                )
-                                # Mark reused tokens as "don't compute".
-                                compute_mask_list[layer_id][abs_start:abs_end] = False
-                                recompute_info.setdefault(
-                                    layer_id,
-                                    [retrieved_k_list[layer_id], retrieved_v_list[layer_id]],
-                                )
-                                compute_mask.setdefault(layer_id, compute_mask_list[layer_id])
                             self.mock_kv_manager.get_kv_many(copy_pairs)
+                            # Plan bookkeeping ONCE (layer-invariant).
+                            block_compute.extend([1, 0])
+                            compute_num.extend(
+                                [reuse_start - last_idx, reuse_end - reuse_start]
+                            )
+                            shared_mask[abs_start:abs_end] = False
                             req_computed += reuse_start - last_idx
                             last_idx = reuse_end
                             # R1 FIX: accumulate dropped rows across the whole batch.
@@ -1689,17 +1687,25 @@ class FlashInferIndicesUpdaterPrefill:
                                 ])
 
             # Trailing compute block for the rest of this request.
-            for layer_id in layer_ids:
-                if last_idx != seq_len:
-                    block_compute_list[layer_id].append(1)
-                    compute_num_list[layer_id].append(seq_len - last_idx)
-                    if layer_id == layer_ids[0]:
-                        req_computed += seq_len - last_idx
-                valid_cumsum[layer_id].append(sum(block_compute_list[layer_id]))
-                total_cumsum[layer_id].append(len(block_compute_list[layer_id]))
+            if last_idx != seq_len:
+                block_compute.append(1)
+                compute_num.append(seq_len - last_idx)
+                req_computed += seq_len - last_idx
+            valid_cumsum.append(sum(block_compute))
+            total_cumsum.append(len(block_compute))
 
             actual_extend_seq_len.append(req_computed if req_computed != 0 else seq_len)
             vlcache_reused_tokens_per_req.append(batch_dropped - req_dropped_start)
+
+        # Publish the shared, layer-invariant plan under every layer id (the
+        # model forward and reuse ctx read them keyed by layer).
+        if any_reuse:
+            for layer_id in layer_ids:
+                compute_mask[layer_id] = shared_mask
+                recompute_info[layer_id] = [
+                    retrieved_k3[layer_id],
+                    retrieved_v3[layer_id],
+                ]
 
         forward_batch.compute_mask = compute_mask
         forward_batch.recompute_info = recompute_info
@@ -1728,47 +1734,38 @@ class FlashInferIndicesUpdaterPrefill:
         if not any_reuse:
             return False
 
-        # Plan the sparse wrapper once per distinct recompute ratio.
-        processed_ratio: dict = {}
-        for layer_id in layer_ids:
-            ratio = self.recompute_ratio_in_layer[layer_id]
-            if ratio in processed_ratio:
-                continue
-            processed_ratio[ratio] = True
+        # Plan the sparse wrapper (single uniform ratio -> single plan; the plan
+        # inputs are layer-invariant).
+        cur_blocks = block_compute if block_compute else [1]
+        cur_nums = compute_num if compute_num else [seq_lens_sum]
 
-            cur_blocks = block_compute_list[layer_id]
-            cur_nums = compute_num_list[layer_id]
-            if not cur_blocks:  # no image in any request this batch
-                cur_blocks = [1]
-                cur_nums = [seq_lens_sum]
+        block_num = len(cur_blocks)
+        row_mask = torch.tensor(cur_blocks, dtype=torch.bool)
+        block_mask_map = torch.tril(
+            torch.ones(block_num, block_num, dtype=torch.bool), diagonal=0
+        )[row_mask].to(device)
+        # Mask cross-attention between different requests in the batch.
+        for si, ei in zip(valid_cumsum[:-1], total_cumsum[:-1]):
+            block_mask_map[si:, :ei] = False
+        block_mask_map = block_mask_map.repeat(self.num_kv_heads, 1, 1)
 
-            block_num = len(cur_blocks)
-            row_mask = torch.tensor(cur_blocks, dtype=torch.bool)
-            block_mask_map = torch.tril(
-                torch.ones(block_num, block_num, dtype=torch.bool), diagonal=0
-            )[row_mask].to(device)
-            # Mask cross-attention between different requests in the batch.
-            for si, ei in zip(valid_cumsum[layer_id][:-1], total_cumsum[layer_id][:-1]):
-                block_mask_map[si:, :ei] = False
-            block_mask_map = block_mask_map.repeat(self.num_kv_heads, 1, 1)
+        block_row_sz = torch.tensor(cur_nums, dtype=torch.int32, device=device)[row_mask]
+        block_row_sz = block_row_sz.repeat(self.num_kv_heads, 1)
+        block_col_sz = torch.tensor([cur_nums], dtype=torch.int32, device=device)
+        block_col_sz = block_col_sz.repeat(self.num_kv_heads, 1)
 
-            block_row_sz = torch.tensor(cur_nums, dtype=torch.int32, device=device)[row_mask]
-            block_row_sz = block_row_sz.repeat(self.num_kv_heads, 1)
-            block_col_sz = torch.tensor([cur_nums], dtype=torch.int32, device=device)
-            block_col_sz = block_col_sz.repeat(self.num_kv_heads, 1)
-
-            prefill_wrappers[ratio].plan(
-                block_mask_map,
-                block_row_sz,
-                block_col_sz,
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                causal=True,
-                non_blocking=True,
-                q_data_type=self.q_data_type,
-                kv_data_type=self.data_type,
-            )
+        prefill_wrappers[self.recompute_ratio_in_layer[0]].plan(
+            block_mask_map,
+            block_row_sz,
+            block_col_sz,
+            self.num_qo_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            causal=True,
+            non_blocking=True,
+            q_data_type=self.q_data_type,
+            kv_data_type=self.data_type,
+        )
 
         return True
 
