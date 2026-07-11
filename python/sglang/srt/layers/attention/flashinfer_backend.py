@@ -1522,7 +1522,6 @@ class FlashInferIndicesUpdaterPrefill:
           - ``recompute_info[layer]`` = [retrieved_k, retrieved_v] loaded from store.
           - ``write_info[layer]``    = [[start, end, uid_k, uid_v], ...] slices of the
                                        *compressed* output to write back to the store.
-          - ``actual_extend_seq_len`` per-request computed-token counts (post-drop).
         And plans the ``VariableBlockSparseAttentionWrapper`` for each distinct ratio.
 
         R1 fix (mixed batches): the compressed compute tensor is a single
@@ -1546,7 +1545,6 @@ class FlashInferIndicesUpdaterPrefill:
         compute_num: List[int] = []  # token count of each block
         valid_cumsum: List[int] = []  # per-request cumulative #compute-blocks
         total_cumsum: List[int] = []  # per-request cumulative #blocks
-        actual_extend_seq_len: List[int] = []
 
         compute_mask: dict = {}
         recompute_info: dict = {}
@@ -1602,7 +1600,6 @@ class FlashInferIndicesUpdaterPrefill:
         ):
             # last_idx tracks, within THIS request, the first not-yet-blocked token.
             last_idx = 0
-            req_computed = 0  # tokens actually computed for this request (post-drop)
             req_dropped_start = batch_dropped  # snapshot to derive this request's reuse
 
             if mm_inputs is not None:
@@ -1693,14 +1690,12 @@ class FlashInferIndicesUpdaterPrefill:
                                     reuse_end - reuse_start,
                                     (end_idx + 1) - reuse_end,
                                 ])
-                                req_computed += (reuse_start - last_idx) + tail_num
                                 last_idx = end_idx + 1
                             else:
                                 block_compute.extend([1, 0])
                                 compute_num.extend(
                                     [reuse_start - last_idx, reuse_end - reuse_start]
                                 )
-                                req_computed += reuse_start - last_idx
                                 last_idx = reuse_end
                             shared_mask[abs_start:abs_end] = False
                             # R1 FIX: accumulate dropped rows across the whole batch.
@@ -1726,11 +1721,9 @@ class FlashInferIndicesUpdaterPrefill:
             if last_idx != seq_len:
                 block_compute.append(1)
                 compute_num.append(seq_len - last_idx)
-                req_computed += seq_len - last_idx
             valid_cumsum.append(sum(block_compute))
             total_cumsum.append(len(block_compute))
 
-            actual_extend_seq_len.append(req_computed if req_computed != 0 else seq_len)
             vlcache_reused_tokens_per_req.append(batch_dropped - req_dropped_start)
 
         # Publish the shared, layer-invariant plan under every layer id (the
@@ -1747,10 +1740,6 @@ class FlashInferIndicesUpdaterPrefill:
         forward_batch.recompute_info = recompute_info
         forward_batch.write_info = write_info
         forward_batch.vlcache_reused_tokens_per_req = vlcache_reused_tokens_per_req
-        if actual_extend_seq_len:
-            forward_batch.actual_extend_seq_len = torch.tensor(
-                actual_extend_seq_len, dtype=torch.int32, device=device
-            )
 
         if _log:
             n_reuse_layers = len(recompute_info)

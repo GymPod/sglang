@@ -447,11 +447,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     #   compute_mask:          {layer_id: bool tensor} True=recompute, False=reuse cached KV
     #   recompute_info:        {layer_id: [retrieved_k, retrieved_v]} reused KV loaded from store
     #   write_info:            {layer_id: [[start, end, uid_k, uid_v], ...]} freshly-computed KV to store
-    #   actual_extend_seq_len: per-request tokens actually computed after reuse removes cached ones
     compute_mask: Optional[Dict[int, torch.Tensor]] = None
     recompute_info: Optional[Dict[int, List[torch.Tensor]]] = None
     write_info: Optional[Dict[int, List[list]]] = None
-    actual_extend_seq_len: Optional[List[int]] = None
     # Per-request count of prompt tokens served from the VLCache image-KV store
     # (reused, not recomputed) this forward, in batch order. Folded into each
     # request's cached_tokens accounting (-> meta_info) by the scheduler's
