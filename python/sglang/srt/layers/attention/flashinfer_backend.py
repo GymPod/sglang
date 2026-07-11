@@ -1452,6 +1452,17 @@ class FlashInferIndicesUpdaterPrefill:
         self.vlcache_enabled = getattr(attn_backend, "vlcache_enabled", False)
         self.mock_kv_manager = getattr(attn_backend, "mock_kv_manager", None)
         self.recompute_ratio_in_layer = getattr(attn_backend, "recompute_ratio_in_layer", None)
+        # R5 experiment (VLCACHE_TAIL_FRAC): the design doc notes reuse error
+        # concentrates at BOTH image<->text boundaries, but the reference recomputes
+        # only the leading head. This knob spends a fraction of the (fixed) per-image
+        # recompute budget on the image's TAIL instead of the head, so head+tail
+        # recompute holds the SAME reuse size -- and thus the same TTFT -- while
+        # covering both boundaries. Default 0.0 => head-only, byte-identical to the
+        # reference geometry. Range [0, 1): the remainder stays on the head.
+        self.vlcache_tail_frac = float(os.environ.get("VLCACHE_TAIL_FRAC", "0.0"))
+        assert 0.0 <= self.vlcache_tail_frac < 1.0, (
+            f"VLCACHE_TAIL_FRAC must be in [0,1), got {self.vlcache_tail_frac}"
+        )
         self.num_hidden_layers = model_runner.model_config.num_hidden_layers
         self.layer_ids = list(range(self.num_hidden_layers))
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -1637,8 +1648,20 @@ class FlashInferIndicesUpdaterPrefill:
                         ratio = self.recompute_ratio_in_layer[0]
                         total_num = end_idx - start_idx + 1
                         recompute_num = max(1, int(total_num * ratio))
-                        reuse_start = start_idx + recompute_num
-                        reuse_end = end_idx + 1
+                        # R5 experiment: spend part of the FIXED recompute budget on the
+                        # image's tail so BOTH image<->text boundaries get recomputed.
+                        # The reused (middle) region is total_num - recompute_num either
+                        # way, so TTFT is unchanged -- this isolates "cover both
+                        # boundaries" from "recompute more". tail_num<=recompute_num-1
+                        # keeps >=1 head row; tail_frac=0 => head-only (reference).
+                        tail_num = (
+                            min(int(recompute_num * self.vlcache_tail_frac), recompute_num - 1)
+                            if self.vlcache_tail_frac
+                            else 0
+                        )
+                        head_num = recompute_num - tail_num
+                        reuse_start = start_idx + head_num
+                        reuse_end = end_idx + 1 - tail_num  # end of the reused MIDDLE
 
                         if image_hit:
                             any_reuse = True
@@ -1659,25 +1682,38 @@ class FlashInferIndicesUpdaterPrefill:
                                     f"{cur_hash}_{layer_id}_tp{self.tp_rank}_v",
                                 ))
                             self.mock_kv_manager.get_kv_many(copy_pairs)
-                            # Plan bookkeeping ONCE (layer-invariant).
-                            block_compute.extend([1, 0])
-                            compute_num.extend(
-                                [reuse_start - last_idx, reuse_end - reuse_start]
-                            )
+                            # Plan bookkeeping ONCE (layer-invariant). Two blocks
+                            # (head-only) or three (head+tail): the trailing [1] compute
+                            # block for the tail attends causally over head+middle via
+                            # the tril block-mask, so no mask change is needed.
+                            if tail_num:
+                                block_compute.extend([1, 0, 1])
+                                compute_num.extend([
+                                    reuse_start - last_idx,
+                                    reuse_end - reuse_start,
+                                    (end_idx + 1) - reuse_end,
+                                ])
+                                req_computed += (reuse_start - last_idx) + tail_num
+                                last_idx = end_idx + 1
+                            else:
+                                block_compute.extend([1, 0])
+                                compute_num.extend(
+                                    [reuse_start - last_idx, reuse_end - reuse_start]
+                                )
+                                req_computed += reuse_start - last_idx
+                                last_idx = reuse_end
                             shared_mask[abs_start:abs_end] = False
-                            req_computed += reuse_start - last_idx
-                            last_idx = reuse_end
                             # R1 FIX: accumulate dropped rows across the whole batch.
                             batch_dropped += reuse_end - reuse_start
                         else:
                             # Cache miss: this image is computed fresh and must be stored.
-                            # Store ONLY the reuse portion (tokens reuse_start..end),
-                            # NOT the recompute head -- a later hit reuses exactly that
-                            # tail (the hit branch reads reuse_start..reuse_end).
+                            # Store ONLY the reused MIDDLE region [reuse_start, reuse_end),
+                            # NOT the recompute head or tail -- a later hit reuses exactly
+                            # that middle (the hit branch reads reuse_start..reuse_end).
                             # Offsets are into the batch-global COMPRESSED tensor:
                             # absolute position minus all dropped rows before this image.
                             real_start = start_loc + reuse_start - batch_dropped
-                            real_end = start_loc + end_idx - batch_dropped  # inclusive
+                            real_end = start_loc + (reuse_end - 1) - batch_dropped  # inclusive
                             for layer_id in layer_ids:
                                 write_info.setdefault(layer_id, []).append([
                                     real_start,
