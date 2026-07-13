@@ -1482,14 +1482,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # holding the state_len (=width-1) preceding raw pre-conv columns, oldest first.
             #
             # Fixed-shape / capture-safe: operate on ALL B rows, indexing conv_states directly by
-            # cache_indices. PAD slots (cache_indices == -1) index the mamba pool's reserved pad row
-            # (the pool allocates size+1, so index -1 is the dummy last row); their conv output is
-            # garbage but unused downstream (GDN zeroes PAD output rows in-kernel). This avoids the
-            # boolean-mask gather/scatter (cache_indices[valid]) whose data-dependent shape forces a
-            # GPU->CPU sync illegal under cuda-graph capture. Valid rows are bit-identical to the
-            # masked path (same idx -> same conv_states row -> same window/conv).
+            # cache_indices. PAD slots carry cache_indices == -1 (PAD_SLOT_ID). Route them to the
+            # mamba pool's reserved dummy row 0 via clamp(min=0): the pool free list is arange(1,
+            # size+1) so row 0 is NEVER allocated to a live request, while raw -1 would wrap to row
+            # `size` (the last ALLOCATABLE row). When the decode batch fills the pool (batch ==
+            # mamba pool size == max_running_requests) and a request finishes, the pad slot's -1
+            # would alias the live request holding row `size`: the scatter below then has a
+            # duplicate index (that live row written by both its real batch position and the pad
+            # slot) whose order is unspecified and resolves differently under cuda-graph replay vs
+            # Megatron prefill, silently corrupting that trajectory's conv history from the first
+            # padded step to EOS. clamp is a no-op for valid indices (>=1) so real rows stay
+            # bit-identical; pad conv output is garbage but zeroed downstream (GDN zeroes PAD rows
+            # in-kernel). Avoids the boolean-mask gather/scatter (cache_indices[valid]) whose
+            # data-dependent shape forces a GPU->CPU sync illegal under cuda-graph capture.
+            safe_idx = cache_indices.clamp(min=0)
             state_len = conv_states.shape[-1]
-            prev = conv_states[cache_indices]  # [B, dim, state_len], oldest first
+            prev = conv_states[safe_idx]  # [B, dim, state_len], oldest first
             window = torch.cat([prev, mixed_qkv.unsqueeze(-1)], dim=-1)  # [B, dim, width]
             conv_out = _causal_depthwise_conv1d(
                 window.float(),
@@ -1501,8 +1509,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 act = F.silu(act)
             mixed_qkv = act.to(mixed_qkv.dtype)  # [B, dim]; PAD rows garbage, zeroed by GDN
             # Roll conv_states left: drop oldest, append the current raw pre-conv column. PAD rows
-            # write the reserved pad row (index -1); duplicate pad writes are harmless scratch.
-            conv_states[cache_indices] = window[:, :, -state_len:].to(conv_states.dtype)
+            # write reserved row 0 (never a live slot); duplicate pad writes there are harmless.
+            conv_states[safe_idx] = window[:, :, -state_len:].to(conv_states.dtype)
         else:
             mixed_qkv = causal_conv1d_update(
                 mixed_qkv,
