@@ -527,6 +527,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 # their KV (driven by write_info in the model forward, independent of
                 # which attention kernel runs), so future hits are unaffected. When no
                 # reuse fired we fall through to the stock paged prefill path below.
+                # VLCACHE_PATH_LOG=1: confirm which prefill path this batch took --
+                # the VLCache sparse-reuse wrapper (any_reuse=True, the intended fast
+                # path) vs falling through to the stock paged prefill (any_reuse=False,
+                # a pure miss/text-only batch). Verifies we're actually exercising reuse
+                # and not silently running the dense kernel every prefill.
+                if os.environ.get("VLCACHE_PATH_LOG") == "1":
+                    logger.info(
+                        "[VLCACHE_PATH] prefill: path=%s (vlcache_enabled=True)",
+                        "sparse_reuse" if any_reuse else "stock_paged_fallthrough",
+                    )
                 if any_reuse:
                     self.forward_metadata = PrefillMetadata(
                         self.prefill_wrappers_variable_block,

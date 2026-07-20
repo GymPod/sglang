@@ -3498,6 +3498,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.graph_runner.can_run(forward_batch)
         )
 
+        # VLCACHE_PATH_LOG=1: verify the decode fast path. Logs whether this forward
+        # replays a captured cuda graph (fast) or falls back to eager, plus the batch
+        # size -- so a silently-eager / low-batch decode regime is visible in the log
+        # instead of only inferable from throughput. Throttled to decode steps and one
+        # line per distinct (can_run_graph, batch_size) transition to avoid spam.
+        if os.environ.get("VLCACHE_PATH_LOG") == "1" and forward_batch.forward_mode.is_decode():
+            _bs = getattr(forward_batch, "batch_size", None)
+            _key = (bool(can_run_graph), _bs)
+            if getattr(self, "_vlcache_decode_path_last", None) != _key:
+                self._vlcache_decode_path_last = _key
+                logger.info(
+                    "[VLCACHE_PATH] decode: cuda_graph_replay=%s batch_size=%s "
+                    "(graph_runner=%s)",
+                    can_run_graph,
+                    _bs,
+                    self.graph_runner is not None,
+                )
+
         # Hisparse coordinator
         if (
             forward_batch.forward_mode.is_decode()
