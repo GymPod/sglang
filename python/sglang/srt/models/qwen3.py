@@ -207,19 +207,20 @@ class Qwen3Attention(nn.Module):
         v = v.contiguous()
         # uids come from write_info (built by the mask-builder), which already scopes
         # them per TP rank -- do NOT re-suffix here, or write/read uids won't match.
+        # Collect all K/V slices for this layer and store them under ONE lock via
+        # write_kv_many, instead of 2 separate locked write_kv calls per slice. The
+        # copies are still stream-ordered (no torch.cuda.synchronize): they run after
+        # the projection that produced part_k/part_v without a device-wide flush.
+        write_pairs = []
         for start_idx, end_idx, uid_k, uid_v in write_info[self.layer_id]:
             # Skip empty slices: at recompute_ratio >= 1.0 the reuse portion is empty
             # (nothing to cache), which would otherwise store a 0-row tensor.
             if end_idx < start_idx:
                 continue
-            part_k = k[start_idx : end_idx + 1, :]
-            part_v = v[start_idx : end_idx + 1, :]
-            # No torch.cuda.synchronize() here: write_kv's copy is issued on the current
-            # stream and is ordered after the projection that produced part_k/part_v, so
-            # it observes materialized data without a device-wide flush. The previous
-            # per-layer sync stalled the whole GPU ~num_layers times per prefill.
-            self.mock_kv_manager.write_kv(part_k, uid_k, non_blocking=True)
-            self.mock_kv_manager.write_kv(part_v, uid_v, non_blocking=True)
+            write_pairs.append((k[start_idx : end_idx + 1, :], uid_k))
+            write_pairs.append((v[start_idx : end_idx + 1, :], uid_v))
+        if write_pairs:
+            self.mock_kv_manager.write_kv_many(write_pairs)
 
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)

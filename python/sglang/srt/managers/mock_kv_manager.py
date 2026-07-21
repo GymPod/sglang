@@ -174,6 +174,44 @@ class MockKVManager:
             return uid, flag
         return uid
 
+    def write_kv_many(self, pairs: List[Tuple[torch.Tensor, str]]) -> None:
+        """Store many (tensor, uid) under ONE lock acquisition (miss-path batch write).
+
+        Mirrors ``get_kv_many`` on the read side: the per-image miss path writes
+        2*num_layers shards, and calling ``write_kv`` once per shard takes the lock
+        2*num_layers times per image. This does the whole set under a single lock.
+        Buffer recycling (freelist), LRU insert, and capacity eviction are identical
+        to ``write_kv`` -- only the lock granularity changes. Copies are stream-ordered
+        (no device sync), same as ``write_kv``'s non-blocking path.
+        """
+        prepared = []
+        for tensor, uid in pairs:
+            if tensor.device.type == "cuda" and not self.keep_on_device:
+                tensor = tensor.contiguous().cpu()
+            num_tokens = tensor.shape[0]
+            elements_per_token = tensor.numel() // num_tokens
+            bytes_per_token = tensor.element_size() * elements_per_token
+            handle = MockGAHandle(num_tokens, bytes_per_token)
+            key = (tuple(tensor.shape), tensor.dtype, str(tensor.device))
+            prepared.append((tensor, uid, handle, key))
+        with self.lock:
+            for tensor, uid, handle, key in prepared:
+                free = self._free_buffers[key]
+                if free:
+                    buf = free.pop()
+                    buf.copy_(tensor)
+                else:
+                    buf = tensor.detach().clone()
+                self.uid_to_handle[uid] = handle
+                self.uid_to_handle.move_to_end(uid)
+                self.uid_to_tensor[uid] = buf
+                if len(self.uid_to_handle) > self.capacity:
+                    evicted_uid, _ = self.uid_to_handle.popitem(last=False)
+                    evicted = self.uid_to_tensor.pop(evicted_uid, None)
+                    if evicted is not None:
+                        ekey = (tuple(evicted.shape), evicted.dtype, str(evicted.device))
+                        self._free_buffers[ekey].append(evicted)
+
     def get_kv(
         self, target_tensor: torch.Tensor, uid: str, non_blocking: bool = False
     ) -> Optional[MockFlag]:
