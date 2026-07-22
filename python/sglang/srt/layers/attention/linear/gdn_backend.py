@@ -890,7 +890,18 @@ def torch_chunk_gated_delta_rule(
     total_sequence_length = sequence_length  # already a multiple of chunk_size
     scale = 1 / (query.shape[-1] ** 0.5)
 
-    initial_state = ssm_states[cache_indices].to(query) if ssm_states is not None else None
+    # ssm_states pool is [slots, HV, V, K] but the recurrence here builds/consumes the state as
+    # [B, HV, K, V] (see the zeros branch below: k_head_dim then v_head_dim). Transpose the last
+    # two dims on read to match, mirroring the writeback (transpose to pool layout) and the
+    # _seed_gdn_replay_cache boundary read. K==V==128 so a shape check would pass, silently
+    # swapping the K/V axes; this only mattered once a NON-ZERO initial state is carried in, i.e.
+    # a multi-pass (chunked) prefill of a prefix longer than chunked_prefill_size. With
+    # disable_radix_cache a single-pass prefill starts from zeros, where the transpose is a no-op.
+    initial_state = (
+        ssm_states[cache_indices].transpose(-1, -2).to(query)
+        if ssm_states is not None
+        else None
+    )
     last_recurrent_state = (
         torch.zeros(
             batch_size, num_heads, k_head_dim, v_head_dim,
