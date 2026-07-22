@@ -1503,7 +1503,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         v_all = v_flat.view(-1, layer.num_v_heads, layer.head_v_dim)
         qsl_cpu = query_start_loc.tolist()
         cidx_cpu = cache_indices.tolist()
-        zero_cidx = torch.zeros(1, dtype=torch.long, device=mixed_qkv.device)
         C = FLA_CHUNK_SIZE
         arena = self._gdn_arena_for(layer)
         out = self._gdn_out_for(layer)  # seeding core output is discarded; write row 0
@@ -1526,11 +1525,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # non-zero prefix state is honored via ssm_states[slot]). Folding is causal so this
             # equals the boundary the full-sequence forward would produce.
             if comp > 0:
-                init_state = (
-                    ssm_states[slot].transpose(-1, -2).unsqueeze(0).float().contiguous()
-                    if ssm_states is not None
-                    else None
-                )
+                # Pass ssm_states straight to torch_chunk_gated_delta_rule in POOL layout
+                # [slots, HV, V, K]: it does its OWN [V,K]->[K,V] transpose on read (line ~901).
+                # Pre-transposing here would double-transpose (K<->V swap) once the carried state
+                # is non-zero, i.e. a multi-pass (chunked) prefill where chunk1's seed reads chunk0's
+                # written state -- the single-pass seed reads zeros so the bug was invisible. This
+                # is the trailing-partial boundary; the double-transpose diverged it ~0.15, cascading
+                # to decode token 0 (dumper: layer0 core_attn_out ~0.25 on a 2-chunk 252-tok prompt).
+                init_state = ssm_states if ssm_states is not None else None
+                cidx = torch.tensor([slot], dtype=torch.long, device=mixed_qkv.device)
                 g_c, beta_c = torch_gdn_gating(
                     layer.A_log, a[start : start + comp], b[start : start + comp], layer.dt_bias
                 )
@@ -1540,7 +1543,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     v_all[start : start + comp].unsqueeze(0),
                     g=g_c, beta=beta_c,
                     ssm_states=init_state,
-                    cache_indices=zero_cidx,
+                    cache_indices=cidx,
                     query_start_loc=torch.tensor([0, comp], dtype=torch.int32, device=mixed_qkv.device),
                 )
                 boundary = boundary.detach()
